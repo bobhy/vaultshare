@@ -1,7 +1,7 @@
 {
-	"name": "sample-go-plugin",
-	"version": "0.0.2",
-	"description": "Sample plugin for Obsidian (https://obsidian.md) demonstrating use of Go/WebAssembly and TypeScript.",
+	"name": "vaultshare",
+	"version": "2.0.0",
+	"description": "Sync vaults by sharing through Google Drive.",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {

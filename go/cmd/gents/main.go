@@ -11,7 +11,7 @@ import (
 	"reflect"
 	"strings"
 
-	"sample-go-plugin/go/settings"
+	"vaultshare/go/settings"
 )
 
 func main() {

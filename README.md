@@ -1,27 +1,26 @@
-# Obsidian Sample Go/Wasm Plugin
+# Obsidian VaultShare 2.0 Plugin
 
-This is a sample plugin for [Obsidian](https://obsidian.md) that demonstrates how to integrate **Go** (compiled to **WebAssembly**) with an Obsidian **TypeScript** plugin into a single self-contained `main.js` bundle.
+Shares local vault with Google Drive, providing a backup and the opportunity to syncronize multiple local vaults.
 
-## What this sample demonstrates
+It is a complete rewrite of Vault-Share V 1.x, using name VaultShare V2.x for ease of migration.  It uses more efficient Drive APIs and is written in Go / Wasm and Typescript to see whether that's a viable platform.
 
-- **Obsidian UI integration**:
-  - Implements an action in Go which displays a configurable message as an Obsidian `Notice`.  This action is invoked from several places.
-  - Implements a (searchable!) plugin setting page with persistent settings to tailor the `Notice` and a button to invoke it from the settings page.
-  - Adds a (`cpu` icon) button on the Obsidian ribbon and a (`Go action`) command in the command palette command which invoke the same formatted `Notice`.
-- **Go integration**
-  - Single-file Wasm bundling: Compiles Go (`GOOS=js GOARCH=wasm`) to `build/plugin.wasm` and embeds the binary directly into `main.js` via esbuild's `binary` loader—so release and installation still only require `main.js` and `manifest.json`.
-  - Single source of truth for settings & types: `go/settings/settings.go` defines the canonical `PluginSettings` and `ActionResult` structs and default values. A lightweight code generator (`go/cmd/gents`) reflects over those Go types at build time to generate `src/settings.generated.ts`.
-  - Lazy Wasm initialization & clean lifecycle: `src/wasm/bridge.ts` instantiates the Go WebAssembly runtime only on first use (keeping Obsidian startup fast) and cleanly shuts down the Go runtime and releases `syscall/js` callbacks inside `onunload()`.
-- **AI coding**
-  - Multi-agent ready: Shared coding-agent instructions and customizations live in `AGENTS.md` and `.agents/`, with symlinks preconfigured for **Gemini** (Antigravity / Gemini CLI), **Claude Code**, and **GitHub Copilot**.
+(user-visible core concepts and capabilities)
+
+## Initial setup
+(user install and initial configuration here)
+
+## Routine use
+(daily user experience)
 
 ## Project structure
+
+This plugin is forked from https://github.com/bobhy/sample-go-plugin with the hope that it can integrate subsequent improvements to the sample.
 
 ```text
 ├── go/
 │   ├── cmd/
 │   │   ├── gents/          # Code generator: Go structs + defaults → src/settings.generated.ts
-│   │   └── plugin/         # Go Wasm entrypoint (js/wasm) exporting callbacks on window.__samplegoplugin
+│   │   └── plugin/         # Go Wasm entrypoint (js/wasm) exporting callbacks on window.__vaultshare
 │   └── settings/           # Canonical PluginSettings, ActionResult, RunAction, and Go unit tests
 ├── src/
 │   ├── main.ts             # Obsidian plugin lifecycle (onload, onunload, command & ribbon registration)
@@ -69,7 +68,7 @@ This is a sample plugin for [Obsidian](https://obsidian.md) that demonstrates ho
 To use this repository as the base for a new plugin while keeping the ability to merge future fixes and enhancements from it, clone with shared Git history and keep this repo as a `sample-base` remote:
 
 ```sh
-git clone <sample-go-plugin-url> my-obsidian-plugin
+git clone <vaultshare-url> my-obsidian-plugin
 cd my-obsidian-plugin
 git remote rename origin sample-base
 gh repo create my-obsidian-plugin --public
@@ -77,7 +76,7 @@ git remote add origin <my-obsidian-plugin-url>
 git push -u origin main
 ```
 
-In your new plugin, update `manifest.json` and `package.json`, and rename `__samplegoplugin` (in `go/cmd/plugin/main.go`, `src/wasm/types.ts`, and `src/wasm/bridge.ts`) to a unique identifier so multiple Go/Wasm plugins do not collide on `window`. Later, you can pull upstream improvements into your plugin with `git fetch sample-base && git merge sample-base/main` (or `git cherry-pick <commit-sha>` for individual fixes).
+In your new plugin, update `manifest.json` and `package.json`, and rename `__vaultshare` (in `go/cmd/plugin/main.go`, `src/wasm/types.ts`, and `src/wasm/bridge.ts`) to a unique identifier so multiple Go/Wasm plugins do not collide on `window`. Later, you can pull upstream improvements into your plugin with `git fetch sample-base && git merge sample-base/main` (or `git cherry-pick <commit-sha>` for individual fixes).
 
 ## Available scripts
 
@@ -94,10 +93,10 @@ In your new plugin, update `manifest.json` and `package.json`, and rename `__sam
 Copy `main.js`, `manifest.json`, and `styles.css` (if used) to your vault's plugins folder:
 
 ```text
-<Vault>/.obsidian/plugins/sample-go-plugin/
+<Vault>/.obsidian/plugins/vaultshare/
 ```
 
-Then reload Obsidian and enable **Sample Go Plugin** under **Settings → Community plugins**. Because `build/plugin.wasm` and `wasm_exec.js` are bundled into `main.js`, no separate `.wasm` file needs to be copied to the vault.
+Then reload Obsidian and enable **VaultShare** under **Settings → Community plugins**. Because `build/plugin.wasm` and `wasm_exec.js` are bundled into `main.js`, no separate `.wasm` file needs to be copied to the vault.
 
 ## Coding agent configuration (Gemini, Claude, GitHub Copilot)
 

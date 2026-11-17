@@ -8,10 +8,10 @@ import (
 	"sync"
 	"syscall/js"
 
-	"sample-go-plugin/go/settings"
+	"vaultshare/go/settings"
 )
 
-const globalNamespace = "__samplegoplugin"
+const globalNamespace = "__vaultshare"
 
 type errorResponse struct {
 	Error string `json:"error"`

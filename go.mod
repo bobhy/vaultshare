@@ -1,3 +1,3 @@
-module sample-go-plugin
+module vaultshare
 
 go 1.27
