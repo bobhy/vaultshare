@@ -12,6 +12,23 @@ It is a complete rewrite of Vault-Share V 1.x, using name VaultShare V2.x for ea
 ## Routine use
 (daily user experience)
 
+## Development
+
+This plugin was forked from https://github.com/bobhy/sample-go-plugin (q.v.)
+
+```sh
+> git clone https://github.com/bobhy/sample-go-plugin ./vaultshare
+> cd ./vaultshare
+> git remote rename origin sample-base
+> gh repo create vaultshare --public
+> git remote add origin https://github.com/bobhy/vaultshare
+> git push -u origin main
+```
+
+The theory is, you can pull upstream improvements to the sample into your plugin with `git fetch sample-base && git merge sample-base/main` (or `git cherry-pick <commit-sha>` for individual fixes).
+
+Most of the business logic is implemented in Go/Wasm as a proof of concept of using web assembly in Obsidian.  See (todo) for pros and cons.
+
 ## Project structure
 
 This plugin is forked from https://github.com/bobhy/sample-go-plugin with the hope that it can integrate subsequent improvements to the sample.
@@ -63,20 +80,6 @@ This plugin is forked from https://github.com/bobhy/sample-go-plugin with the ho
 
 > **Note on watch mode (`npm run dev`)**: `npm run dev` runs `npm run build:wasm` once before starting esbuild's TypeScript watcher. After editing files under `go/`, run `npm run build:wasm` in another terminal to regenerate `src/settings.generated.ts` and `build/plugin.wasm`—esbuild will automatically pick up the updated files and rebuild `main.js`.
 
-## Starting your own plugin from this sample
-
-To use this repository as the base for a new plugin while keeping the ability to merge future fixes and enhancements from it, clone with shared Git history and keep this repo as a `sample-base` remote:
-
-```sh
-git clone <vaultshare-url> my-obsidian-plugin
-cd my-obsidian-plugin
-git remote rename origin sample-base
-gh repo create my-obsidian-plugin --public
-git remote add origin <my-obsidian-plugin-url>
-git push -u origin main
-```
-
-In your new plugin, update `manifest.json` and `package.json`, and rename `__vaultshare` (in `go/cmd/plugin/main.go`, `src/wasm/types.ts`, and `src/wasm/bridge.ts`) to a unique identifier so multiple Go/Wasm plugins do not collide on `window`. Later, you can pull upstream improvements into your plugin with `git fetch sample-base && git merge sample-base/main` (or `git cherry-pick <commit-sha>` for individual fixes).
 
 ## Available scripts
 
