@@ -3,7 +3,7 @@
 	"name": "VaultShare",
 	"version": "2.0.0",
 	"minAppVersion": "1.13.0",
-	"description": "Sample plugin for Obsidian (https://obsidian.md) demonstrating use of Go/WebAssembly and TypeScript.",
+	"description": "Two-way sync between your vault and Google Drive using Go/WebAssembly.",
 	"author": "Bob Hyman",
 	"isDesktopOnly": false
 }
