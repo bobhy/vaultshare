@@ -92,13 +92,13 @@ All requests use explicit `fields` projections. Standard file projection:
   `fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(<standard projection>))`. Page through `nextPageToken`;
   `newStartPageToken` is returned to the engine, which persists it only after the batch's tasks finish (see sync-engine-design.md).
 - **Uploads**: `multipart` when size ≤ 5 MiB; otherwise `resumable` session with chunks that are multiples of 256 KiB (default 4 MiB),
-  resuming from the server-reported `Range` after a failed chunk. Keeps peak memory bounded on mobile.
+  omitting `Authorization` on chunk `PUT`s (pre-authorized session URI), resuming from server `Range` on failure, and restarting on `404`/`410`.
 - **Duplicate prevention**:
-  - Pre-generate IDs with `files.generateIds` (`space=drive`, `type=files`); a retried create with the same ID fails with a conflict instead
-    of creating a second file, which is treated as success after `files.get` confirms it.
-  - Per-`(parentID, name)` in-process single-flight lock (not folder-wide across 30 s retries) with a `files.list` existence check before create, so
-    one client never races itself without stalling unrelated files in the same folder. Cross-client duplicates remain possible and are resolved
-    by Full Scan + N-version resolution.
+  - Call `files.generateIds` (`space=drive`, `type=files`) **once before** the retry loop; a retried create reuses that ID and treats
+    `409 Conflict` → `files.get` verification (exists, non-trashed, matching size/md5) as idempotent success.
+  - Per-`(parentID, name)` in-process single-flight lock (not folder-wide across 30 s retries) with a `files.list` existence check before create.
+    When `foldersByPath` has duplicate Drive folders, `EnsureFolderPath`/creates target one canonical folder (oldest `modifiedTime`/smallest ID)
+    while `FindByPath` queries all matching parent IDs. Cross-client duplicates are resolved by Full Scan + N-version resolution.
 
 ## 6. Field Semantics Relied Upon (Verified in Drive v3 `File` Reference)
 

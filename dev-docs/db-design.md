@@ -124,6 +124,10 @@ type FolderRecord struct {
 | `"clientId"` | `ClientIDMeta` | `ID string` — per-vault UUID for diagnostics/logging |
 | `"fullScan"` | `FullScanMeta` | `Initialized bool`, `LastStartedAtMs`, `LastCompletedAtMs` |
 
+- **`syncRootFolder` change handling**: When `settings.syncRootFolder` differs from `meta["syncRoot"].RootFolderName`, confirm with the user,
+  clear `files`, `folders`, and `changeToken` (preserving `clientId` and `engineState`), resolve/create the new `RootFolderID`, capture a fresh
+  `GetStartPageToken()`, and run `Full Scan`.
+
 ## 4. Crash-Safety & Recovery Invariants (No `pending_tasks` Store)
 
 1. **Drive `changes.list` batching**: Capture `GetStartPageToken()` **before** startup Full Scan starts. Track each poll batch via a

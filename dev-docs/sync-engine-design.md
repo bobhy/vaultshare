@@ -14,10 +14,11 @@ type VaultPort interface {
 	Stat(ctx context.Context, path string) (LocalStat, bool, error)
 	ListAllStats(ctx context.Context) ([]LocalStat, error) // reads Obsidian in-memory vault.getFiles()
 	ReadBytes(ctx context.Context, path string) ([]byte, LocalStat, error)
-	WriteBytes(ctx context.Context, path string, data []byte) (LocalStat, error)
-	Rename(ctx context.Context, oldPath, newPath string) error
+	WriteText(ctx context.Context, path string, text string) (LocalStat, error)   // vault.modify/create for text views
+	WriteBytes(ctx context.Context, path string, data []byte) (LocalStat, error)  // vault.modifyBinary/createBinary
+	Rename(ctx context.Context, oldPath, newPath string) error                    // vault.rename (no cross-note link rewrites)
 	Trash(ctx context.Context, path string) error
-	ExistsInTrash(ctx context.Context, path string) (bool, error)
+	ExistsInTrash(ctx context.Context, path string, size int64) (bool, error)     // scans .trash (handles flat + " N" suffixes)
 	// Shows "Synchronizing..." overlay + read-only editor guard only if path is open in a view.
 	WithOpenFileLock(ctx context.Context, path string, fn func(context.Context) error) error
 }
@@ -60,7 +61,7 @@ type EventSink interface {
 - **`OnLocalOpen(path)`** (`workspace.on('file-open')`): **never debounced**; enqueues immediately at `PriorityHigh`.
 - **`OnLocalRename(oldPath, newPath)`** (`vault.on('rename')`): authoritative in-Obsidian rename (for `TFolder`, walks all tracked descendant paths
   in `Cache`). Suppresses follow-up echo, mirrors via `DrivePort.MoveRenameFile` + `Cache.MigrateFilePath` (preserving `LastSyncedRevisionID`),
-  or falls back to conflict check if missing on Drive.
+  or falls back to conflict check if missing on Drive. Remote renames mirror locally via `VaultPort.Rename` (`vault.rename`, no link rewrites).
 - **`OnLocalModify(path)` / `OnLocalCreate(path)`**:
   1. Check `recentLocalWrites` / `LastSynced` checksum+mtime to ignore self-echoes.
   2. For `Create`, check `pendingDeletes` first (size + hash match → symmetric rename correlation).
@@ -69,9 +70,10 @@ type EventSink interface {
   1. If `TFolder`, expands to all tracked descendant paths in `Cache`.
   2. Held in `pendingDeletes` (1–2 s) alongside cached `{size, md5, sha256}` from `Cache`.
   3. Symmetrically checks `pendingCreates` (handling external renames where `create` arrives before `delete`).
-  4. On match: converts to a single rename operation; on expiry without match: enqueues `PriorityHigh` delete/sync check.
-- **Scope & exclusions**: Exclude `app.vault.configDir` (`.obsidian/`) and `.trash/` across local events, `changes.list`, and `Full Scan` so
-  Obsidian config/trash directories are never synced even if touched on Drive by v1.
+  4. On match: converts to a single rename operation; on expiry without match: records in-session local delete and enqueues `PriorityHigh` check.
+- **Scope & exclusions**: Exclude `app.vault.configDir` (`.obsidian/`), `.trash/`, and non-folder Google Docs native MIME types
+  (`application/vnd.google-apps.*`, logged `WARN` once so Docs/Sheets/Shortcuts never poison scans) across local events, `changes.list`, and
+  `Full Scan`.
 - **Startup local stat diff**: Immediately after `Cache.LoadAll(ctx)`, compare `VaultPort.ListAllStats` against `Cache.Files` in memory:
   - Correlate vanished vs. new local files by size + SHA-256/MD5 hash (offline renames while Obsidian was closed).
   - Enqueue all modified/created/deleted/renamed local files at `PriorityHigh`.
@@ -81,12 +83,14 @@ type EventSink interface {
 ### Google Drive Poller (`changes.list`)
 - Capture `GetStartPageToken()` **before** startup `Full Scan` begins. Poll on active/idle cadence (Advanced settings); skip while `Paused`.
 - Processes `ChangePage` entries:
-  1. Update `folders` cache first, handling all folder transitions: rename in place, move within sync root, move into sync root (walk subtree),
-     move out of sync root, and `trashed`/`removed` (cascade path migrations or local trash/conflict checks across all descendant `folders`
-     and `files`, updating `driveIDToPath`).
-  2. Filter scope in O(depth) memory via `foldersByID` parent chain (ignore items outside `syncRoot.RootFolderID` or in excluded paths).
+  1. Check `foldersByID[change.FileID]` **before** inspecting `change.File` (permanently deleted folders with `removed: true` omit `file`).
+     Update `folders` cache across all transitions: rename in place, move within sync root, move into sync root (walk subtree), move out of
+     sync root, and `trashed`/`removed` (cascade path migrations or local trash/conflict checks across descendant `folders` and `files`).
+  2. Filter scope in O(depth) memory via `foldersByID` parent chain (ignore items outside `syncRoot.RootFolderID` or in excluded paths/MIME).
   3. Resolve path (via `driveIDToPath[fileId]` for existing/renamed/trashed files, or `folder.Path + "/" + name` for new files).
   4. Filter echoes via `recentDriveWrites` and `LastSynced` revision/checksum match; enqueue affected paths at `PriorityHigh`.
+- **Duplicate Drive folders**: When `len(foldersByPath[p]) > 1`, `FindByPath` queries all matching parent IDs, writes target one canonical folder,
+  and `Full Scan` consolidates/cleans duplicate folders.
 - **Crash-safe token commit**: Track batch completion via a `pendingBatchPaths` set; persist `meta["changeToken"]` once non-errored batch paths
   finish (errored/offline paths move to retry so they cannot starve Drive polling).
 
@@ -130,8 +134,9 @@ Every task ignores stale trigger payloads and evaluates fresh state in two phase
 2. **Single-sided change**:
    - Local modified/created, Drive unchanged/absent → upload (`UpdateFile` / `CreateFile` with local `mtimeMs`).
    - Drive modified/created, local unchanged/absent → `DownloadFile` **before** `WithOpenFileLock` → write local inside lock.
-   - One side deleted, other unchanged → check trash confirmation (`DriveFile.Trashed` or `VaultPort.ExistsInTrash` in `.trash`); if confirmed,
-     mirror trash (`TrashFile` / `VaultPort.Trash`) and clear `FileRecord`. If unconfirmed, flag `Conflict{Kind: "missing"}`.
+   - One side deleted, other unchanged → check trash confirmation (`DriveFile.Trashed`, in-session `vault.on('delete')`, or
+     `VaultPort.ExistsInTrash(path, size)` scanning `.trash` for flat/`" N"` collision matches); if confirmed, mirror trash
+     (`TrashFile` / `VaultPort.Trash`) and clear `FileRecord`. If unconfirmed, flag `Conflict{Kind: "missing"}`.
 3. **Modify-vs-delete conflict** (one side modified, other side trashed/missing) → flag directly as `Conflict{Kind: "missing"}` for manual
    resolution (no v1 placeholder side-files).
 4. **Content / duplicate conflict (`N >= 2` distinct versions)** → walk `PluginSettings.SyncResolution` in configured order:

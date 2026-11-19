@@ -52,9 +52,9 @@ merge with the Drive folder "quickly" (seconds), as will subsequent edits made i
 Most of the sync operations don't affect files the user is looking at and get done invisibly 
 in background (though perhaps updating the folder tree or status indicators).
 
-If a sync operation needs to modify a file the user *is* looking at, then user sees a brief interruption: 
-s/he sees a spinner and is prevented from changing the file while synchronization is updating it.  
-If the user was making edits of his/her own, the typeahead buffer is preserved across the update and applied afterwards (potentially in the wrong place!).
+If a sync operation needs to modify a file the user *is* looking at, then user sees a brief interruption:
+s/he sees a spinner and is prevented from changing the file while synchronization is updating it.
+Any edits already typed before the interruption are preserved, while keystrokes during the brief lock are blocked rather than being replayed afterward.
 
 ## Architectural Concepts
 Key concepts in the user's mental model and perhaps also in the implementation of the plugin.
@@ -296,6 +296,7 @@ Window autorefreshes, but has a refresh button with a countdown till next refres
 
 ### Updating an open file, file locking
 A sync event or Full Scan may need to update a file while the user has it open.  When that happens, the open file view will display an overlay with text "Synchronizing..." that prevents user changes to the file.  
+Any unsaved edits typed before the lock are flushed before reading, while keystrokes during the overlay are blocked rather than buffered.
 Sync will then read the content of the file if needed for the sync operation, write back the updated content and finally remove the overlay, allowing 
 user interaction once again.
 Sync will arrange the order of operations to minimize the time that the file is locked out. (e.g, will read any necessary content from Google Drive before locking the file)
