@@ -90,7 +90,8 @@ Always run `npm run test:go && npm run build && npm run lint` and verify all che
 - **Strict mode**: `"strict": true` in `tsconfig.json`. Never use `any` or `as any`; use `unknown` and runtime type-narrowing helpers (`asserts value is ...`), or `as unknown as TargetType` when crossing untyped `window` globals.
 - **Keep `main.ts` minimal**: Focus only on plugin lifecycle (`onload`, `onunload`, `addCommand`, `addRibbonIcon`, `addSettingTab`). Put UI in `src/settings.ts` (or `src/ui/`), Wasm interop in `src/wasm/`, and domain logic in Go (`go/`).
 - **Split large files**: Keep modules focused and split files around ~200–300 lines.
-- **Documentation**: Document modules and public classes/methods/interfaces with TypeDoc comments.
+- **Documentation**: Human-readable design documentation lives in source code via module-level TypeDoc/TSDoc overviews and public identifier docs.
+  Compact agent-oriented technical specs live in `dev-docs/`, split into focused files per subsystem.
 - **Linting**: `eslint-plugin-obsidianmd` is enforced (`npm run lint`). Do not disable `@typescript-eslint/no-explicit-any` or `obsidianmd/*` rules—fix the underlying code.
 
 ### Go & WebAssembly
@@ -99,6 +100,8 @@ Always run `npm run test:go && npm run build && npm run lint` and verify all che
 - Isolate `syscall/js` glue in `go/cmd/plugin/main.go` behind `//go:build js && wasm`.
 - Every `js.FuncOf(...)` allocation must be paired with `Release()` on shutdown to avoid leaking references in the renderer process.
 - Keep the Wasm binary small (`-ldflags="-s -w"` in `build:wasm`) and avoid pulling in heavy third-party Go dependencies when the standard library suffices.
+- **Documentation**: Document every Go package with a package-level godoc overview (`// Package <name> ...`) and exported symbol godoc comments
+  as the human-readable design documentation.
 
 ## Obsidian plugin guidelines
 
@@ -112,6 +115,8 @@ Always run `npm run test:go && npm run build && npm run lint` and verify all che
 
 - **Sentence case is enforced by ESLint (`obsidianmd/ui/sentence-case`)**: Use sentence case for all `.setName()`, `.setDesc()`, `.setButtonText()`, ribbon tooltips, and command names (e.g., `'Greeting prefix'`, `'Go action'`).
 - Use **bold** for literal UI labels and arrow notation for navigation (**Settings → Community plugins**).
+- **Persistent Notices**: All `new Notice(msg, 0)` calls must pass duration `0` so Notices stay visible until dismissed by the user
+  (e.g., startup Notice when conflict resolution loads in a paused state).
 
 ### Security, privacy, and resource cleanup
 
