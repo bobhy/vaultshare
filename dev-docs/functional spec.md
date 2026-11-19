@@ -133,8 +133,9 @@ will treat them as additional conflicting versions of a file to be reconciled.
 Duplicate Drive files may not be detected by event-driven sync as an efficiency concern, but are always detected by Full Scan.
 
 ### handling file renames
-Obsidian does not provide reliable rename events.  
-Plugin will attempt to correllate delete and create events to infer a rename, then mirror that on the "other" side with the native file move or file rename operation.
+In-Obsidian renames are handled directly via `vault.on('rename')`. For external renames (where Obsidian emits separate delete and create
+events in unspecified order), the plugin correlates pending deletes and creates symmetrically by size/checksum, and matches vanished vs.
+new files on startup, mirroring inferred renames on the other side with native move/rename operations.
 
 ### handling file deletions
 
@@ -247,8 +248,10 @@ When user says Pause, any currently active task runs to completion, but no more 
 When user says Resume, the next task is started.
 
 Global status indicator shows current state.
+The paused state persists across plugin restarts; if the plugin loads paused, it displays a persistent Notice
+(all plugin Notices persist until explicitly dismissed by the user).
 
-Note user doesn't have direct control over Full Scan.
+Full Scan has no separate pause control, but automatically pauses whenever conflict resolution is paused and resumes when resumed.
 
 ### Command: Reconcile conflicts
 
