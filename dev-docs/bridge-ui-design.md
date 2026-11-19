@@ -30,7 +30,7 @@ Runtime validators in `src/wasm/validators.ts` narrow parsed JSON without `any`.
 | `start` | `PluginSettings` → `GlobalStatusEvent` | Loads IDB + refresh token; runs startup stat diff; starts engine/poller. |
 | `updateSettings` | `PluginSettings` → `{}` | Reconfigures timers, `MaxPendingRequests`, `SyncResolution` live. |
 | `setRefreshToken` | `{token}` → `GlobalStatusEvent` | Stores in `SecretStorage`, clears `NeedsLogin`, triggers immediate sync. |
-| `logout` | `{}` → `GlobalStatusEvent` | Best-effort Google revoke, clears secret, enters `NeedsLogin`. |
+| `logout` | `{}` → `GlobalStatusEvent` | Clears local SecretStorage secret (no Google `/revoke`), enters `NeedsLogin`. |
 | `onVaultEvent` | `VaultEventPayload` → `{}` | `kind`: `"open"\|"create"\|"modify"\|"delete"\|"rename"`. |
 | `flushHighPriority` | `{}` → `{drained: bool}` | Cancels local debounces and waits for High-pri queue + in-flight High. |
 | `pause` / `resume` | `{}` → `GlobalStatusEvent` | Persists `engineState.Paused`; pauses/resumes workers and Full Scan. |
@@ -51,18 +51,19 @@ Injected once before `bridge.start(...)` (zero per-API JSON fat thunks):
 - `emitEvent(kind: string, jsonPayload: string): void`: routes `globalStatus`, `logEntry`, and `notice` to Obsidian `Events` / `Notice`.
 
 ### Codegen (`go/cmd/gents/main.go` → `src/settings.generated.ts`)
-Extend `gents` to emit `PluginSettings`, `SyncStatusSnapshot`, `GlobalStatusEvent`, `LogEntry`, `ConflictItem`, and `DEFAULT_SETTINGS`,
-supporting nested structs, slices, and optional pointer fields (`omitempty` → `?:`). Never hand-edit `src/settings.generated.ts`.
+Extend `gents` (currently primitive-only) in Milestone 1 to emit recursive structs, slices, pointers (`omitempty` → `?:`), and maps for
+`PluginSettings`, `SyncStatusSnapshot`, `GlobalStatusEvent`, `LogEntry`, `ConflictItem`, and `DEFAULT_SETTINGS`. Never hand-edit generated TS.
 
 ## 3. Open-File Locking Overlay (`src/ui/open-file-lock.ts`)
 
 1. Go completes all Drive downloads/revision fetches **before** calling `host.withOpenFileLock(path, fn)`.
-2. TS checks `app.workspace.getLeavesOfType('markdown')` (and matching open file views) for `leaf.view.file?.path === path`:
+2. TS checks `app.workspace.getLeavesOfType('markdown')` (and matching open `TextFileView`s) for `leaf.view.file?.path === path`:
    - If not open: invoke `await fn()` immediately with zero UI overhead.
-   - If open: attach a `"Synchronizing..."` overlay element (`pointer-events: all`, spinner + label) to `view.containerEl` / `contentEl` and
-     dispatch a CM6 `Compartment` effect setting `EditorView.editable.of(false)` (preserving scroll position and typeahead buffer).
-3. Run `await fn()` (local read/merge/write via `vault.process` or `vault.modify`), then restore `EditorView.editable.of(true)` and remove the
-   overlay in `finally`.
+   - If open: attach `"Synchronizing..."` overlay (`pointer-events: all`, spinner + label) to `view.containerEl` / `contentEl`, dispatch a CM6
+     `Compartment` effect setting `EditorView.editable.of(false)` (keystrokes while locked are blocked, not buffered), and call `await view.save()`
+     so Obsidian's 2 s `requestSave` buffer flushes to disk before Go reads.
+3. Suppress local `modify` echoes during the lock, run `await fn()` (`vault.process` / `vault.modify`), then restore `EditorView.editable.of(true)`
+   and remove the overlay in `finally`.
 
 ## 4. Global Conflict Indicator (`src/ui/global-status-bar.ts`)
 
@@ -103,7 +104,9 @@ Path A (`minAppVersion: "1.13.0"`): implement `getSettingDefinitions()` only (no
 - **Account**: Auth status + **Log in** / **Log out** button (`render`); visible `drive.file` limitation note.
 - **Sync**: `syncRootFolder` (default sanitized vault name → `My Drive/VaultShare/<syncRootFolder>`), ordered `syncResolution` list (max 3 of the
   optional rules + `Manual resolution` always last; `Merge (text only)` must be first if present), `disableTextMerge` toggle.
-- **Trash warning**: Visible warning notice row when Obsidian's trash setting is not `.trash` (cannot verify OS trash for delete conflicts).
+- **Trash warning**: Visible warning notice row when Obsidian's trash setting is not `.trash`. Because `Vault.getConfig` and `trashOption` are not
+  public in `obsidian.d.ts`, defensively read `${app.vault.configDir}/app.json` via `vault.adapter.read` (treating missing `trashOption` as
+  system trash).
 - **Advanced (Timers & Concurrency)**: `localDebounceMs`, `localMaxWaitMs`, `drivePollActiveMs`, `drivePollIdleMs`, `fullScanIntervalMin`,
   `maxPendingRequests` (1–10 slider), `logMinSeverity`, `logHorizon`.
 - Mutating settings calls `saveSettings()` + `bridge.updateSettings(settings)`.

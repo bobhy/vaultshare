@@ -126,8 +126,9 @@ type FolderRecord struct {
 
 ## 4. Crash-Safety & Recovery Invariants (No `pending_tasks` Store)
 
-1. **Drive `changes.list` batching**: Persist `meta["changeToken"]` **only after** all resolution tasks spawned by that `changes.list` poll
-   finish. If Obsidian is paused or killed mid-batch, next startup replays that small delta idempotently.
+1. **Drive `changes.list` batching**: Capture `GetStartPageToken()` **before** startup Full Scan starts. Track each poll batch via a
+   `pendingBatchPaths` set; persist `meta["changeToken"]` once non-errored batch paths finish (errored/offline paths move to retry rather than
+   starving future polls). If killed mid-batch, next startup replays that delta idempotently.
 2. **Local edits on startup**: Immediately after `LoadAll(ctx)`, diff Obsidian's in-memory `vault.getFiles()` (`stat.mtime` + `stat.size`, zero file
    content reads) against `filesByPath` and enqueue changed/created/deleted local files at High priority (also catches edits made while closed).
 3. **Startup Full Scan**: Runs with randomized starting position / traversal order to audit Drive duplicates and recover any unseen remote shifts.
@@ -158,6 +159,10 @@ type Store interface {
   `LastSynced.LastSyncedRevisionID` and `driveIDToPath`.
 - `PutFolders` writes all supplied `FolderRecord`s in **one `readwrite` transaction** on `folders` (used for folder discovery and subtree path
   rewrites after folder renames/moves).
+- **IDB safety invariants**:
+  - `openDB` must single-flight `factory.Open` under a mutex/promise so concurrent startup callers never open duplicate connections (`onblocked`).
+  - Inside any open IDB transaction, queue all `Put`/`Delete` requests synchronously before calling `tx.Await(ctx)`—never call `awaitPromise` or
+    yield on Go channels mid-transaction (which causes IDB auto-commit and `TransactionInactiveError`).
 
 ## 6. Testing Contract (`go test ./go/syncstate/...`)
 

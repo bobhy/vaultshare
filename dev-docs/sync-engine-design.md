@@ -58,28 +58,37 @@ type EventSink interface {
 
 ### Local Vault Events (`src/main.ts` → Go)
 - **`OnLocalOpen(path)`** (`workspace.on('file-open')`): **never debounced**; enqueues immediately at `PriorityHigh`.
-- **`OnLocalRename(oldPath, newPath)`** (`vault.on('rename')`): authoritative in-Obsidian rename. Suppresses follow-up echo, mirrors via
-  `DrivePort.MoveRenameFile` + `Cache.MigrateFilePath` (preserving `LastSyncedRevisionID`), or falls back to conflict check if missing on Drive.
+- **`OnLocalRename(oldPath, newPath)`** (`vault.on('rename')`): authoritative in-Obsidian rename (for `TFolder`, walks all tracked descendant paths
+  in `Cache`). Suppresses follow-up echo, mirrors via `DrivePort.MoveRenameFile` + `Cache.MigrateFilePath` (preserving `LastSyncedRevisionID`),
+  or falls back to conflict check if missing on Drive.
 - **`OnLocalModify(path)` / `OnLocalCreate(path)`**:
   1. Check `recentLocalWrites` / `LastSynced` checksum+mtime to ignore self-echoes.
   2. For `Create`, check `pendingDeletes` first (size + hash match → symmetric rename correlation).
   3. Otherwise start/reset per-path trailing hold-down debounce timer with max-wait cap (Advanced settings) → enqueue at `PriorityHigh`.
 - **`OnLocalDelete(path)`**:
-  1. Held in `pendingDeletes` (1–2 s) alongside cached `{size, md5, sha256}` from `Cache`.
-  2. Symmetrically checks `pendingCreates` (handling external renames where `create` arrives before `delete`).
-  3. On match: converts to a single rename operation; on expiry without match: enqueues `PriorityHigh` delete/sync check.
+  1. If `TFolder`, expands to all tracked descendant paths in `Cache`.
+  2. Held in `pendingDeletes` (1–2 s) alongside cached `{size, md5, sha256}` from `Cache`.
+  3. Symmetrically checks `pendingCreates` (handling external renames where `create` arrives before `delete`).
+  4. On match: converts to a single rename operation; on expiry without match: enqueues `PriorityHigh` delete/sync check.
+- **Scope & exclusions**: Exclude `app.vault.configDir` (`.obsidian/`) and `.trash/` across local events, `changes.list`, and `Full Scan` so
+  Obsidian config/trash directories are never synced even if touched on Drive by v1.
 - **Startup local stat diff**: Immediately after `Cache.LoadAll(ctx)`, compare `VaultPort.ListAllStats` against `Cache.Files` in memory:
   - Correlate vanished vs. new local files by size + SHA-256/MD5 hash (offline renames while Obsidian was closed).
   - Enqueue all modified/created/deleted/renamed local files at `PriorityHigh`.
+- **TODO (slow non-text file creation)**: Open Question #1 (`functional spec.md`) remains deferred — add a size/mtime stability probe before
+  uploading newly created non-text files.
 
 ### Google Drive Poller (`changes.list`)
-- Runs on active/idle cadence (Advanced settings). Skips polling while `Paused == true` or while the previous poll batch still has tasks pending.
+- Capture `GetStartPageToken()` **before** startup `Full Scan` begins. Poll on active/idle cadence (Advanced settings); skip while `Paused`.
 - Processes `ChangePage` entries:
-  1. Update `folders` cache first; if an existing Drive folder moved *into* the sync root, walk its subtree to discover child folders/files.
-  2. Filter scope in O(depth) memory via `foldersByID` parent chain (ignore items outside `syncRoot.RootFolderID`).
+  1. Update `folders` cache first, handling all folder transitions: rename in place, move within sync root, move into sync root (walk subtree),
+     move out of sync root, and `trashed`/`removed` (cascade path migrations or local trash/conflict checks across all descendant `folders`
+     and `files`, updating `driveIDToPath`).
+  2. Filter scope in O(depth) memory via `foldersByID` parent chain (ignore items outside `syncRoot.RootFolderID` or in excluded paths).
   3. Resolve path (via `driveIDToPath[fileId]` for existing/renamed/trashed files, or `folder.Path + "/" + name` for new files).
   4. Filter echoes via `recentDriveWrites` and `LastSynced` revision/checksum match; enqueue affected paths at `PriorityHigh`.
-- **Crash-safe token commit**: Track remaining task count for that poll batch; persist `meta["changeToken"]` **only after** the counter hits `0`.
+- **Crash-safe token commit**: Track batch completion via a `pendingBatchPaths` set; persist `meta["changeToken"]` once non-errored batch paths
+  finish (errored/offline paths move to retry so they cannot starve Drive polling).
 
 ### Dual Echo Suppression
 - `recentLocalWrites[path]` and `recentDriveWrites[fileID]` store `{expiresAtMs, md5, mtimeMs}` (~15 s TTL) to drop immediate watcher/poll echoes.
@@ -98,6 +107,8 @@ type EventSink interface {
 - **Concurrency & Parallel I/O**:
   - Worker pool of `N` goroutines (default 4; outbound Drive HTTP concurrency bounded by `MaxPendingRequests`).
   - Inside each task, Vault `Stat`/`Read` and Drive metadata/download requests run concurrently in child goroutines via `syscall/js` `Await`.
+  - **Deadlock invariant**: Never hold any Go `sync.Mutex` (`queueMu`, `cacheMu`, etc.) across `awaitPromise`, `VaultPort`, `DrivePort`,
+    `syncstate.Store`, or `EventSink` calls, so JS→Go re-entry cannot deadlock waiting goroutines.
 - **Pause / Resume**:
   - `Pause()` sets and persists `meta["engineState"].Paused = true`; active workers finish cleanly, no new tasks dequeue, and **Full Scan pauses**.
   - On startup, if `engineState.Paused == true`, keep workers paused and call `EventSink.EmitNotice(...)` (persistent Notice, `duration = 0`).
@@ -125,9 +136,11 @@ Every task ignores stale trigger payloads and evaluates fresh state in two phase
    resolution (no v1 placeholder side-files).
 4. **Content / duplicate conflict (`N >= 2` distinct versions)** → walk `PluginSettings.SyncResolution` in configured order:
    - **`Merge (text only)`**: Skip if `DisableTextMerge` or non-text extension. Pre-fetch all Drive version contents + `DownloadRevision(fileID,
-     LastSyncedRevisionID)` **before** locking. Inside `WithOpenFileLock`, re-read local, run N-way merge, write local. Release lock, upload
-     merged result to primary Drive file, trash extra Drive duplicates. If conflict markers remain, set `Conflict{Kind: "markers"}`; if merge
-     cannot apply cleanly (e.g., binary/malformed markers), fall through to next rule.
+     LastSyncedRevisionID)` **before** locking. Inside `WithOpenFileLock`, re-read local, run N-way merge (clean text uses 3-way `diff3`; any
+     marker-bearing text uses `nway` `ReconcileText` union, never raw `diff3`), write local. Release lock, re-check `GetFileMeta(fileID).
+     headRevisionId` immediately before `UpdateFile` (re-run merge if Drive changed in the meantime), upload merged result to primary Drive file,
+     trash extra Drive duplicates, and always advance `FileRecord.LastSynced` to the uploaded `headRevisionId` + checksum. If conflict markers
+     remain, also set `Conflict{Kind: "markers"}`; if merge cannot apply cleanly (binary/malformed), fall through to next rule.
    - **`Keep newest` / `Keep oldest`**: Compare `mtimeMs` / `modifiedTime` across all N versions. If a Drive version wins, download **before**
      `WithOpenFileLock`, write local, and trash remaining Drive duplicates; if local wins, upload local and trash extra Drive duplicates.
    - **`Keep local`**: Upload local to primary Drive file (or create) and trash extra Drive duplicates.

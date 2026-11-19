@@ -25,10 +25,12 @@ and `../test-gdoc/go/cmd/plugin/roundtripper.go`.
 
 1. Settings **Log in** button → `getAuthorizationUrl()`: `response_type=code`, `access_type=offline`, `prompt=consent`, `scope=drive.file`,
    `redirect_uri=${RELAY_BASE_URL}/google/callback`, `state=btoa(JSON.stringify({app:'vault-share', nonce}))` (32-char crypto nonce).
-2. Open URL in system browser (`window.open`); relay exchanges the code and redirects to `obsidian://vault-share-auth?...&refresh_token=...`.
+2. Open URL in system browser (`window.open(url, '_blank', 'noopener,noreferrer')`); relay exchanges the code and redirects to
+   `obsidian://vault-share-auth?...&refresh_token=...`.
 3. `registerObsidianProtocolHandler(OAUTH_PROTOCOL_ACTION, ...)` → verify `state` (one-shot) → pass refresh token to Go via
    `bridge.setRefreshToken(token)`. TS never stores tokens itself.
-4. **Log out** → Go revokes at `https://oauth2.googleapis.com/revoke` (best effort) and clears the secret.
+4. **Log out** → Clear only the local `SecretStorage` key (do **not** call Google `/revoke`, which revokes the OAuth grant across all devices
+   sharing that Google account).
 - Before registering the protocol handler, `onload()` runs the V1 presence check (`isVaultSharePresent`, from test-gdoc) and stays dormant
   with a persistent Notice if vault-share is installed or enabled.
 
@@ -94,8 +96,9 @@ All requests use explicit `fields` projections. Standard file projection:
 - **Duplicate prevention**:
   - Pre-generate IDs with `files.generateIds` (`space=drive`, `type=files`); a retried create with the same ID fails with a conflict instead
     of creating a second file, which is treated as success after `files.get` confirms it.
-  - Per-folder in-process create lock (`map[parentID]*sync.Mutex`) with a `files.list` existence check before create, so one client never
-    races itself. Cross-client duplicates remain possible and are resolved by Full Scan + N-version resolution.
+  - Per-`(parentID, name)` in-process single-flight lock (not folder-wide across 30 s retries) with a `files.list` existence check before create, so
+    one client never races itself without stalling unrelated files in the same folder. Cross-client duplicates remain possible and are resolved
+    by Full Scan + N-version resolution.
 
 ## 6. Field Semantics Relied Upon (Verified in Drive v3 `File` Reference)
 
