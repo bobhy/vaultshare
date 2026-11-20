@@ -10,7 +10,7 @@ import {
 	ConflictMarkerNavigator,
 	parseConflictBlocks,
 } from './conflict-marker-navigator';
-import { severityRank } from './log-view';
+import { formatLogMessage, severityRank } from './log-view';
 import { normalizeSyncResolutionRules } from '../settings';
 
 function makeMockEditor(initialLines: string[]): {
@@ -112,5 +112,39 @@ describe('UI configuration helpers', () => {
 		expect(severityRank('DEBUG')).toBeLessThan(severityRank('INFO'));
 		expect(severityRank('INFO')).toBeLessThan(severityRank('WARNING'));
 		expect(severityRank('WARNING')).toBeLessThan(severityRank('ERROR'));
+	});
+
+	it('formats log entries on a single line separated by colon', () => {
+		expect(
+			formatLogMessage({
+				timestampMs: 1,
+				severity: 'INFO',
+				message: 'Full Scan completed',
+				detail: 'scanned=2',
+			}),
+		).toBe('Full Scan completed: scanned=2');
+		expect(
+			formatLogMessage({
+				timestampMs: 2,
+				severity: 'INFO',
+				message: 'Pushed local edit to Drive',
+				detail: 'Second note.md',
+			}),
+		).toBe('Pushed local edit to Drive: Second note.md');
+		expect(
+			formatLogMessage({
+				timestampMs: 3,
+				severity: 'WARNING',
+				message: 'Drive error',
+				detail: 'line 1\nline 2',
+			}),
+		).toBe('Drive error: line 1 line 2');
+		expect(
+			formatLogMessage({
+				timestampMs: 4,
+				severity: 'INFO',
+				message: 'Conflict resolution paused',
+			}),
+		).toBe('Conflict resolution paused');
 	});
 });

@@ -29,6 +29,16 @@ export function severityRank(sev: string): number {
 }
 
 /**
+ * Formats a `LogEntry` into a single-line message, joining non-empty details
+ * with `": "` and collapsing embedded newlines into spaces.
+ */
+export function formatLogMessage(entry: LogEntry): string {
+	const msg = entry.message.replace(/\s+/g, ' ').trim();
+	const detail = entry.detail ? entry.detail.replace(/\s+/g, ' ').trim() : '';
+	return detail ? `${msg}: ${detail}` : msg;
+}
+
+/**
  * Displays structured sync engine logs fetched from Go's ring buffer and pushed
  * live while open.
  */
@@ -175,12 +185,18 @@ export class LogView extends ItemView {
 				cls: `vaultshare-log-row sev-${e.severity.toLowerCase()}`,
 			});
 			const ts = new Date(e.timestampMs).toLocaleTimeString();
+			const msg = e.message.replace(/\s+/g, ' ').trim();
+			const detail = e.detail ? e.detail.replace(/\s+/g, ' ').trim() : '';
 			row.createSpan({ cls: 'vaultshare-log-time', text: ts });
 			row.createSpan({ cls: 'vaultshare-log-sev', text: e.severity });
-			row.createSpan({ cls: 'vaultshare-log-msg', text: e.message });
-			if (e.detail) {
-				row.createDiv({ cls: 'vaultshare-log-detail', text: e.detail });
+			row.createSpan({
+				cls: 'vaultshare-log-msg',
+				text: detail ? `${msg}: ` : msg,
+			});
+			if (detail) {
+				row.createSpan({ cls: 'vaultshare-log-detail', text: detail });
 			}
+			row.setAttribute('title', formatLogMessage(e));
 		}
 	}
 }
