@@ -77,7 +77,8 @@ func (e *Engine) resolvePathLocked(ctx context.Context, relPath string) error {
 		rec = syncstate.FileRecord{Path: relPath}
 	}
 
-	// Fast-path exit when both sides match LastSynced.
+	// Fast-path exit when both sides match LastSynced (including unchanged
+	// ConflictMarkers files, whose markers remain flagged until edited).
 	if rec.LastSynced != nil && localFound && len(driveFiles) == 1 {
 		df := driveFiles[0]
 		if !df.Trashed &&
@@ -86,7 +87,7 @@ func (e *Engine) resolvePathLocked(ctx context.Context, relPath string) error {
 			df.ID == rec.LastSynced.DriveFileID &&
 			df.HeadRevisionID == rec.LastSynced.LastSyncedRevisionID &&
 			df.ModifiedTime == rec.LastSynced.DriveModifiedTime &&
-			rec.Conflict == nil {
+			(rec.Conflict == nil || rec.Conflict.Kind == syncstate.ConflictMarkers) {
 			return nil
 		}
 	}
@@ -186,7 +187,7 @@ func (e *Engine) resolvePathLocked(ctx context.Context, relPath string) error {
 
 	// Case 4: Both sides exist. Check if all versions are identical.
 	if len(driveFiles) == 1 && versionsIdentical(localStat, localSHA, localMD5, driveFiles[0]) {
-		return e.saveSyncedRecord(ctx, relPath, localStat, localSHA, localMD5, driveFiles[0])
+		return e.saveSyncedRecord(ctx, relPath, localStat, localData, localSHA, localMD5, driveFiles[0])
 	}
 
 	// Single-sided change fast paths when LastSynced exists and there are no Drive duplicates.
@@ -300,7 +301,7 @@ func (e *Engine) pushNewLocalFile(
 	e.recordDriveEcho(created.ID, md5Hex)
 	e.metrics.IncResolution(func(c *settings.ResolutionCounters) { c.Pushed++ })
 	e.log(settings.LogInfo, "Uploaded new file to Drive", relPath)
-	return e.saveSyncedRecord(ctx, relPath, st, shaHex, md5Hex, created)
+	return e.saveSyncedRecord(ctx, relPath, st, data, shaHex, md5Hex, created)
 }
 
 func (e *Engine) pushExistingLocalFile(
@@ -333,7 +334,7 @@ func (e *Engine) pushExistingLocalFile(
 	e.recordDriveEcho(updated.ID, md5Hex)
 	e.metrics.IncResolution(func(c *settings.ResolutionCounters) { c.Pushed++ })
 	e.log(settings.LogInfo, "Pushed local edit to Drive", relPath)
-	return e.saveSyncedRecord(ctx, relPath, st, shaHex, md5Hex, updated)
+	return e.saveSyncedRecord(ctx, relPath, st, data, shaHex, md5Hex, updated)
 }
 
 func (e *Engine) pullNewDriveFile(ctx context.Context, relPath string, df gdrive.DriveFile) error {
@@ -396,7 +397,7 @@ func (e *Engine) pullDriveFile(ctx context.Context, relPath string, df gdrive.Dr
 	} else {
 		e.log(settings.LogInfo, "Pulled remote update from Drive", relPath)
 	}
-	return e.saveSyncedRecord(ctx, relPath, newStat, shaHex, md5Hex, df)
+	return e.saveSyncedRecord(ctx, relPath, newStat, data, shaHex, md5Hex, df)
 }
 
 func (e *Engine) writeLocalContent(ctx context.Context, relPath string, data []byte) (LocalStat, error) {
@@ -746,14 +747,35 @@ func (e *Engine) flagVersionsConflict(
 	return nil
 }
 
+func (e *Engine) detectMarkerConflict(relPath string, data []byte) *syncstate.ConflictState {
+	if !merge.IsTextMergePath(relPath) || len(data) == 0 {
+		return nil
+	}
+	if !merge.HasConflictMarkersWith(string(data), merge.StyleForPath(relPath)) {
+		return nil
+	}
+	if prev, ok := e.cache.GetFile(relPath); ok && prev.Conflict != nil && prev.Conflict.Kind == syncstate.ConflictMarkers {
+		copied := *prev.Conflict
+		return &copied
+	}
+	e.metrics.IncResolution(func(c *settings.ResolutionCounters) { c.ManualFlagged++ })
+	return &syncstate.ConflictState{
+		Kind:         syncstate.ConflictMarkers,
+		DetectedAtMs: e.now().UnixMilli(),
+		Summary:      "File contains unresolved conflict markers",
+	}
+}
+
 func (e *Engine) saveSyncedRecord(
 	ctx context.Context,
 	relPath string,
 	st LocalStat,
+	data []byte,
 	shaHex, md5Hex string,
 	df gdrive.DriveFile,
 ) error {
-	return e.saveRecordWithConflict(ctx, relPath, st, shaHex, md5Hex, df, nil)
+	conflict := e.detectMarkerConflict(relPath, data)
+	return e.saveRecordWithConflict(ctx, relPath, st, shaHex, md5Hex, df, conflict)
 }
 
 func (e *Engine) saveRecordWithConflict(

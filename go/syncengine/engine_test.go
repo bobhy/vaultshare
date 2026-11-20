@@ -1229,3 +1229,44 @@ func TestEpochResetHaltsOldWorkersAndClearsQueue(t *testing.T) {
 	}
 	eng.Stop()
 }
+
+func TestConflictMarkersSurviveSubsequentResolvePathAndClearWhenResolved(t *testing.T) {
+	ctx := context.Background()
+	eng, v, d, _, _ := newTestEngine(t)
+	base := "line1\nshared line\nline3\n"
+	v.SetFile("Welcome.md", base, 1_700_000_000_100)
+	df := d.SeedFile(d.rootID, "Welcome.md", base, 1_700_000_000_100, "rev-1")
+
+	if err := eng.Start(ctx, settings.DefaultSettings(), "MyVault", false); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := eng.resolvePath(ctx, "Welcome.md"); err != nil {
+		t.Fatalf("baseline sync: %v", err)
+	}
+
+	// Conflicting edits on the same line -> 3-way merge inserts conflict markers.
+	v.SetFile("Welcome.md", "line1\nlocal edit\nline3\n", 1_700_000_000_200)
+	d.UpdateRemoteFile(df.ID, "line1\ndrive edit\nline3\n", 1_700_000_000_300)
+	if err := eng.resolvePath(ctx, "Welcome.md"); err != nil {
+		t.Fatalf("merge resolvePath: %v", err)
+	}
+
+	// Simulate an immediate follow-up resolvePath (e.g. from file-open or Full Scan).
+	if err := eng.resolvePath(ctx, "Welcome.md"); err != nil {
+		t.Fatalf("follow-up resolvePath: %v", err)
+	}
+	conflicts := eng.ListConflicts()
+	if len(conflicts) != 1 || conflicts[0].Path != "Welcome.md" || conflicts[0].Kind != syncstate.ConflictMarkers {
+		t.Fatalf("expected ConflictMarkers preserved after follow-up resolvePath, got %+v", conflicts)
+	}
+
+	// User resolves markers locally and saves -> follow-up resolvePath pushes clean text and clears ConflictMarkers.
+	v.SetFile("Welcome.md", "line1\nresolved edit\nline3\n", 1_700_000_000_500)
+	if err := eng.resolvePath(ctx, "Welcome.md"); err != nil {
+		t.Fatalf("post-resolve resolvePath: %v", err)
+	}
+	if got := eng.ListConflicts(); len(got) != 0 {
+		t.Fatalf("expected ConflictMarkers cleared after markers removed, got %+v", got)
+	}
+	eng.Stop()
+}
