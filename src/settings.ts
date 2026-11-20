@@ -6,12 +6,18 @@
 
 import {
 	type App,
+	type ButtonComponent,
+	type EventRef,
 	Notice,
 	PluginSettingTab,
 	type SettingDefinitionItem,
 } from 'obsidian';
 import type VaultSharePlugin from './main';
-import { DEFAULT_SETTINGS, type PluginSettings } from './settings.generated';
+import {
+	DEFAULT_SETTINGS,
+	type GlobalStatusEvent,
+	type PluginSettings,
+} from './settings.generated';
 
 export { DEFAULT_SETTINGS, type PluginSettings };
 
@@ -74,11 +80,21 @@ export function normalizeSyncResolutionRules(rules: readonly string[]): string[]
  */
 export class VaultShareSettingTab extends PluginSettingTab {
 	private readonly plugin: VaultSharePlugin;
+	private statusRef: EventRef | null = null;
 
 	/** Creates the settings tab bound to the active plugin instance. */
 	constructor(app: App, plugin: VaultSharePlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
+	}
+
+	/** Detaches any live global status listener when the settings tab closes. */
+	hide(): void {
+		const bridge = this.plugin.getBridge();
+		if (bridge && this.statusRef) {
+			bridge.offref(this.statusRef);
+		}
+		this.statusRef = null;
 	}
 
 	/**
@@ -95,21 +111,51 @@ export class VaultShareSettingTab extends PluginSettingTab {
 						name: 'Google Drive account',
 						desc: 'Only files created by VaultShare are visible under the drive.file scope.',
 						render: (setting) => {
-							setting.addButton((button) =>
-								button
-									.setButtonText('Log in')
-									.setCta()
-									.onClick(() => {
+							const statusEl = setting.descEl.createDiv({
+								cls: 'vaultshare-settings-note',
+							});
+							let authBtn: ButtonComponent | null = null;
+							let needsLogin = this.plugin.getGlobalStatus().needsLogin;
+
+							const syncAuthUI = (ev: GlobalStatusEvent): void => {
+								needsLogin = ev.needsLogin;
+								statusEl.setText(
+									needsLogin
+										? 'Status: Sign in required'
+										: 'Status: Connected to Google Drive',
+								);
+								if (!authBtn) {
+									return;
+								}
+								if (needsLogin) {
+									authBtn.setButtonText('Log in').setCta();
+								} else {
+									authBtn.setButtonText('Log out').removeCta();
+								}
+							};
+
+							setting.addButton((button) => {
+								authBtn = button;
+								button.onClick(async () => {
+									if (needsLogin) {
 										this.plugin.startGoogleLogin();
-									}),
-							);
-							setting.addButton((button) =>
-								button
-									.setButtonText('Log out')
-									.onClick(async () => {
+									} else {
 										await this.plugin.logoutFromGoogle();
-									}),
-							);
+									}
+								});
+							});
+
+							syncAuthUI(this.plugin.getGlobalStatus());
+
+							const bridge = this.plugin.getBridge();
+							if (bridge) {
+								if (this.statusRef) {
+									bridge.offref(this.statusRef);
+								}
+								this.statusRef = bridge.on('globalStatus', (payload: unknown) => {
+									syncAuthUI(payload as GlobalStatusEvent);
+								});
+							}
 						},
 					},
 					{

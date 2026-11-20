@@ -472,7 +472,7 @@ type startPageTokenResp struct {
 
 // GetStartPageToken fetches the current Drive changes cursor.
 func (c *Client) GetStartPageToken(ctx context.Context) (string, error) {
-	reqURL := fmt.Sprintf("%s/changes/getStartPageToken", c.apiBase)
+	reqURL := fmt.Sprintf("%s/changes/startPageToken", c.apiBase)
 	status, body, err := c.doAuthenticated(ctx, http.MethodGet, reqURL, nil, nil)
 	if err != nil {
 		return "", err

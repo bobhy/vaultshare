@@ -152,6 +152,9 @@ func TestResumableUploadAndChangesPaging(t *testing.T) {
 			received = append(received, rest...)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"f-big","name":"big.bin","size":"1024","headRevisionId":"r-2"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/drive/v3/changes/startPageToken":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(startPageTokenResp{StartPageToken: "start-42"})
 		case r.URL.Path == "/drive/v3/changes":
 			pt := r.URL.Query().Get("pageToken")
 			w.Header().Set("Content-Type", "application/json")
@@ -177,6 +180,11 @@ func TestResumableUploadAndChangesPaging(t *testing.T) {
 	status, body, err := client.uploadResumable(ctx, http.MethodPatch, srv.URL+"/upload/drive/v3/files/f-big?uploadType=resumable", map[string]any{}, "application/octet-stream", payload)
 	if err != nil || status != http.StatusOK || !bytes.Equal(received, payload) {
 		t.Fatalf("uploadResumable = (status=%d, err=%v, len=%d, body=%s)", status, err, len(received), string(body))
+	}
+
+	tok, err := client.GetStartPageToken(ctx)
+	if err != nil || tok != "start-42" {
+		t.Fatalf("GetStartPageToken = (%q, %v), want (start-42, nil)", tok, err)
 	}
 
 	changes, err := client.ListChanges(ctx, "p1")

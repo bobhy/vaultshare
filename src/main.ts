@@ -33,6 +33,11 @@ export default class VaultSharePlugin extends Plugin {
 	private readonly oauth = new OAuthFlow();
 	private wasmBridge: GoWasmBridge | null = null;
 	private statusIndicator: GlobalStatusIndicator | null = null;
+	private currentStatus: GlobalStatusEvent = {
+		paused: false,
+		needsLogin: true,
+		conflictsTotal: 0,
+	};
 	private markerNavigator!: ConflictMarkerNavigator;
 	private dormant = false;
 
@@ -83,7 +88,7 @@ export default class VaultSharePlugin extends Plugin {
 
 		this.registerEvent(
 			this.wasmBridge.on('globalStatus', (payload: unknown) => {
-				this.statusIndicator?.update(payload as GlobalStatusEvent);
+				this.applyGlobalStatus(payload as GlobalStatusEvent);
 			}),
 		);
 
@@ -148,7 +153,8 @@ export default class VaultSharePlugin extends Plugin {
 			return;
 		}
 		try {
-			await this.wasmBridge.logout();
+			const status = await this.wasmBridge.logout();
+			this.applyGlobalStatus(status);
 			new Notice('Logged out of Google Drive.', 0);
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
@@ -159,6 +165,11 @@ export default class VaultSharePlugin extends Plugin {
 	/** Exposes the active Wasm bridge instance for Milestone 6 workspace views. */
 	getBridge(): GoWasmBridge | null {
 		return this.wasmBridge;
+	}
+
+	/** Returns the latest known engine status (paused, needsLogin, conflictsTotal). */
+	getGlobalStatus(): GlobalStatusEvent {
+		return this.currentStatus;
 	}
 
 	/** Exposes the conflict marker navigator for editor and reconcile views. */
@@ -323,7 +334,7 @@ export default class VaultSharePlugin extends Plugin {
 		}
 		try {
 			const status = await this.wasmBridge.start(this.settings);
-			this.statusIndicator?.update(status);
+			this.applyGlobalStatus(status);
 			this.registerVaultWatchers();
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
@@ -387,13 +398,19 @@ export default class VaultSharePlugin extends Plugin {
 		});
 	}
 
+	private applyGlobalStatus(ev: GlobalStatusEvent): void {
+		this.currentStatus = ev;
+		this.statusIndicator?.update(ev);
+	}
+
 	private async handleOAuthCallback(params: Record<string, string | undefined>): Promise<void> {
 		if (!this.wasmBridge || this.dormant) {
 			return;
 		}
 		try {
 			const refreshToken = this.oauth.handleAuthCallback(params);
-			await this.wasmBridge.setRefreshToken(refreshToken);
+			const status = await this.wasmBridge.setRefreshToken(refreshToken);
+			this.applyGlobalStatus(status);
 			new Notice('Connected to Google Drive.', 0);
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
