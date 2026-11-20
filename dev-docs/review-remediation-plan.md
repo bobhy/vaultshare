@@ -132,5 +132,6 @@ Tracks the multi-batch remediation of all findings from the whole-codebase revie
 - [ ] **B5.3 (`M14`, `L1`–`L6`) Repo config hygiene (`.gitignore`, `package.json`, `eslint.config.mts`, `version-bump.mjs`, `.npmrc`):**
   - Fix `.gitignore` LF line endings and `.vscode` trailing space; fix `"license": "0BSD"` and remove unused `devDependencies` in `package.json`; clean up obsolete sample-plugin rules in `eslint.config.mts`; ensure trailing newlines in `version-bump.mjs` and `.npmrc`.
 - [ ] **B5.4 (`H25`, Spec Section 5) Update `AGENTS.md`, `README.md`, and `dev-docs/*.md`:**
-  - Replace legacy sample-plugin references in `AGENTS.md` and `README.md` with VaultShare V2 architecture, commands, `npm test`, `.trash` recommendation, and `drive.file` scope documentation.
+  - `AGENTS.md`: done 2026-11-20. Rewritten to hold only stable rules and to defer architecture, interfaces and layout to `dev-docs/` and godoc/TSDoc. Don't add V2 architecture back into it.
+  - Replace legacy sample-plugin references in `README.md` with VaultShare V2 architecture, commands, `npm test`, `.trash` recommendation, and `drive.file` scope documentation.
   - Synchronize `dev-docs/{functional spec.md,sync-engine-design.md,drive-api-design.md,db-design.md,bridge-ui-design.md}` with the final V2 interfaces and behavior.

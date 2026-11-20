@@ -1,139 +1,111 @@
-# Obsidian Go/Wasm Sample Plugin — Agent Instructions
+# VaultShare — Agent Instructions
 
-## Project overview
+VaultShare is an Obsidian community plugin that syncs a vault two ways with Google Drive. Domain
+logic is written in Go compiled to WebAssembly (`GOOS=js GOARCH=wasm`). A thin TypeScript shell
+handles the Obsidian lifecycle and UI, and esbuild bundles both into a single `main.js`.
 
-- **Target**: Sample Obsidian Community Plugin demonstrating integration of **Go** (compiled to WebAssembly via `GOOS=js GOARCH=wasm`) with **TypeScript**, bundled into a single `main.js` artifact.
-- **Entry points**:
-  - TypeScript: `src/main.ts` compiled and bundled with `build/wasm_exec.js` and `build/plugin.wasm` into `main.js`.
-  - Go Wasm: `go/cmd/plugin/main.go` compiled to `build/plugin.wasm`.
-  - Codegen: `go/cmd/gents/main.go` reflects over `go/settings` structs and defaults to generate `src/settings.generated.ts`.
-- **Required release artifacts**: `main.js`, `manifest.json`, and optional `styles.css` (the `.wasm` binary and `wasm_exec.js` glue are embedded directly in `main.js` by esbuild).
+This file holds only rules that stay true as the code evolves. It deliberately does **not**
+describe modules, interfaces, file layout or feature lists: those live in the design docs below.
 
-## Multi-agent configuration (Gemini, Claude Code, GitHub Copilot)
+## Where design knowledge lives
 
-This repository is configured so **Gemini** (Antigravity / Gemini CLI), **Claude Code**, and **GitHub Copilot** share a single set of instructions, skills, and rules:
+| What | Where |
+| :--- | :--- |
+| User-facing behavior and scenarios | `dev-docs/functional spec.md` |
+| Compact, agent-oriented subsystem specs | `dev-docs/*-design.md`; each names its scope and source directories in its first lines |
+| In-flight multi-step work | `dev-docs/*-plan.md` |
+| Human-readable design detail | Package godoc under `go/` (`doc.go` / `// Package ...`) and module TSDoc in `src/` |
+| Go/Wasm ↔ Obsidian interop patterns | `.agents/rules/` (always loaded) and `.agents/skills/` (on demand) |
 
-- **Project instructions**: `AGENTS.md` is the canonical file.
-  - `CLAUDE.md` → symlink to `AGENTS.md`
-  - `GEMINI.md` → symlink to `AGENTS.md`
-  - `.github/copilot-instructions.md` → symlink to `../AGENTS.md`
-- **Shared skills**: `.agents/skills/` is the canonical directory (following the [Agent Skills](https://agentskills.io) format).
-  - `.claude/skills` → symlink to `../.agents/skills`
-  - `.gemini/skills` → symlink to `../.agents/skills`
-  - `.github/skills` → symlink to `../.agents/skills`
-- **Shared rules**: `.agents/rules/` is the canonical directory for modular rule files (`*.md`).
-  - `.claude/rules` → symlink to `../.agents/rules`
+- **Before changing a subsystem**, read the design doc whose scope covers it, then the godoc/TSDoc
+  of the code you touch. If code and doc disagree, point out the conflict and ask which is right;
+  don't silently follow either.
+- **When a change alters a documented interface, behavior or structure**, update the design doc
+  and godoc/TSDoc in the same change. A new subsystem gets its own `dev-docs/<name>-design.md`.
+- **If a `dev-docs/*-plan.md` covers your task**, follow its workflow and check items off as they
+  are verified.
+- **Keep this file stable**: don't add architecture, file trees, interface names or feature lists
+  here. Put them in `dev-docs/` or in source docs.
 
-**Rule for agents**: Always edit `AGENTS.md` and files inside `.agents/` directly. Never replace a symlink with a standalone copy.
+## Multi-agent configuration
 
-## Environment & tooling
+Gemini (Antigravity / Gemini CLI), Claude Code and GitHub Copilot share one set of instructions,
+skills and rules through symlinks:
 
-- **Node.js**: Current LTS (Node 20.19+ minimum; Node 26 LTS recommended).
-- **Go**: Go 1.26+ toolchain (`go.mod` targets Go 1.27; required for `go/cmd/gents` reflection iterators and `GOOS=js GOARCH=wasm` builds).
-- **Package manager**: `npm` (`package.json` defines all build, codegen, lint, and test scripts).
-- **Bundler**: `esbuild` (`esbuild.config.mjs` bundles TypeScript, `build/wasm_exec.js`, and `build/plugin.wasm` via the `.wasm: 'binary'` loader into `main.js`).
+- **Instructions**: `AGENTS.md` is canonical; `CLAUDE.md`, `GEMINI.md` and
+  `.github/copilot-instructions.md` are symlinks to it.
+- **Skills** ([Agent Skills](https://agentskills.io) format): `.agents/skills/` is canonical;
+  `.claude/skills`, `.gemini/skills` and `.github/skills` are symlinks to it.
+- **Rules**: `.agents/rules/*.md` is canonical; `.claude/rules` is a symlink to it.
 
-### Commands
+Always edit `AGENTS.md` and files inside `.agents/` directly. Never replace a symlink with a
+standalone copy. See `.agents/README.md` for how to add skills and rules.
 
-```sh
-npm install          # Install Node dependencies
-npm run build:wasm   # Generate src/settings.generated.ts, compile build/plugin.wasm, copy build/wasm_exec.js
-npm run dev          # Run build:wasm once, then start esbuild in watch mode
-npm run build        # Run build:wasm, tsc type-check, and production esbuild bundle
-npm run lint         # Run ESLint (with eslint-plugin-obsidianmd)
-npm run test:go      # Run Go unit tests (go test ./go/...)
-```
+## Toolchain and checks
 
-Always run `npm run test:go && npm test && npm run build && npm run lint` and verify all checks pass before reporting work as done.
+- **Node.js**: current LTS. **Go**: the version required by `go.mod`. **Package manager**: npm.
+- All build, codegen, lint and test entry points are `package.json` scripts; read them there.
+  Key ones: `npm run build:wasm` (codegen + Wasm), `npm run dev` (watch), `npm run build`,
+  `npm test` (Vitest), `npm run test:go`, `npm run lint`.
+- Before reporting work as done, run and pass:
+  `npm run test:go && npm test && npm run build && npm run lint`
+  (an active plan may require a stricter variant; follow it).
+- To try a change in a live Obsidian test vault (deploy, run commands, screenshot, read errors),
+  use the `obsidian-dev-loop` skill.
 
-> **Active Remediation Plan**: Multi-batch bugfix and spec-alignment checklist lives in `dev-docs/review-remediation-plan.md`. Check and update it as batches are completed.
+## Engineering rules
 
-## Architecture & file structure
+### Go / WebAssembly
 
-```text
-├── go/
-│   ├── cmd/
-│   │   ├── gents/main.go       # Codegen: reflects Go structs/defaults → src/settings.generated.ts
-│   │   └── plugin/main.go      # Wasm main (//go:build js && wasm); mounts window.__vaultshare
-│   └── settings/
-│       ├── settings.go         # Single source of truth: PluginSettings, ActionResult, DefaultSettings, RunAction
-│       └── settings_test.go    # Go unit tests for settings serialization and RunAction
-├── src/
-│   ├── main.ts                 # Plugin lifecycle only (onload, onunload, ribbon/command/settings registration)
-│   ├── settings.ts             # GoWasmSettingTab (Obsidian PluginSettingTab UI)
-│   ├── settings.generated.ts   # Generated by go/cmd/gents — DO NOT EDIT MANUALLY (gitignored)
-│   └── wasm/
-│       ├── bridge.ts           # GoWasmBridge: lazy Wasm initialization, JSON marshaling, runtime validation, unload()
-│       ├── types.ts            # TypeScript types for wasm_exec.js Go runtime and window.__vaultshare
-│       └── wasm.d.ts           # Ambient declaration for *.wasm binary imports
-├── build/                      # Generated Wasm artifacts (plugin.wasm, wasm_exec.js) — gitignored
-├── esbuild.config.mjs          # esbuild configuration (.wasm loaded as binary Uint8Array)
-├── eslint.config.mts           # ESLint flat config with eslint-plugin-obsidianmd
-├── manifest.json               # Obsidian plugin manifest
-└── package.json                # Scripts and devDependencies
-```
-
-### Go ↔ TypeScript contract
-
-1. **Single source of truth for shared types**:
-   - Define shared configuration and response structs in `go/settings/settings.go` with explicit `json:"..."` tags and default values in `DefaultSettings()`.
-   - Run `npm run build:wasm` (or `go run ./go/cmd/gents`) to regenerate `src/settings.generated.ts`.
-   - Never hand-edit `src/settings.generated.ts`. If new field kinds are added to shared structs, update `go/cmd/gents/main.go` (`goTypeToTS` / `tsLiteral`) and re-run `npm run build:wasm`.
-2. **Lazy Wasm instantiation & clean teardown**:
-   - Do **not** instantiate the Wasm module inside `onload()`. `GoWasmBridge` initializes `build/plugin.wasm` lazily on the first `runAction()` call to keep Obsidian startup fast.
-   - Always call `this.wasmBridge.unload()` in `onunload()` so the Go `main()` goroutine exits (`close(done)`), removes `window.__vaultshare`, and releases `js.Func` callbacks via `defer ...Release()`.
-3. **Boundary validation**:
-   - Cross the JS/Wasm boundary using JSON strings (`api.runAction(JSON.stringify(settings))`) and validate parsed responses in TypeScript (`assertActionResult` in `src/wasm/bridge.ts`) without `any` casts.
-
-## Coding conventions
+- **Pure-Go core**: keep domain logic in `go/` packages that don't import `syscall/js`, so it runs
+  under native `go test ./go/...`. Confine `syscall/js` glue to `go/cmd/plugin/`, behind
+  `//go:build js && wasm`.
+- **Go-first shared types**: define types shared with TypeScript in Go with explicit `json:"..."`
+  tags. TypeScript types are generated by `go/cmd/gents` (`npm run build:wasm`). Never hand-edit
+  `src/*.generated.ts`; extend `gents` when it can't express a new field kind.
+- **Lifecycle**: don't instantiate Wasm in `onload()` (initialize lazily on first use), and tear it
+  down completely in `onunload()`. Pair every `js.FuncOf(...)` with `Release()`.
+- **Small binary**: keep `-ldflags="-s -w"` and prefer the standard library over heavy third-party
+  dependencies.
+- **Docs**: every Go package has a package-level godoc overview, and every exported symbol has a
+  godoc comment.
 
 ### TypeScript
 
-- **Strict mode**: `"strict": true` in `tsconfig.json`. Never use `any` or `as any`; use `unknown` and runtime type-narrowing helpers (`asserts value is ...`), or `as unknown as TargetType` when crossing untyped `window` globals.
-- **Keep `main.ts` minimal**: Focus only on plugin lifecycle (`onload`, `onunload`, `addCommand`, `addRibbonIcon`, `addSettingTab`). Put UI in `src/settings.ts` (or `src/ui/`), Wasm interop in `src/wasm/`, and domain logic in Go (`go/`).
-- **Split large files**: Keep modules focused and split files around ~200–300 lines.
-- **Documentation**: Human-readable design documentation lives in source code via module-level TypeDoc/TSDoc overviews and public identifier docs.
-  Compact agent-oriented technical specs live in `dev-docs/`, split into focused files per subsystem.
-- **Linting**: `eslint-plugin-obsidianmd` is enforced (`npm run lint`). Do not disable `@typescript-eslint/no-explicit-any` or `obsidianmd/*` rules—fix the underlying code.
+- `"strict": true`. Never use `any` or `as any`: use `unknown` with runtime narrowing
+  (`asserts value is ...`), or `as unknown as T` for untyped globals. Validate every value that
+  crosses the JS/Wasm boundary at runtime.
+- `src/main.ts` handles plugin lifecycle and registration only. UI, Wasm interop, auth and other
+  concerns live in their own modules under `src/`.
+- Keep modules focused; split files at ~200–300 lines.
+- Every module has a TSDoc module overview, and every public identifier has a TSDoc comment.
+- `eslint-plugin-obsidianmd` is enforced. Don't disable `@typescript-eslint/no-explicit-any` or
+  `obsidianmd/*` rules; fix the code.
 
-### Go & WebAssembly
+## Obsidian plugin rules
 
-- Keep core business logic in pure Go packages (like `go/settings`) free of `syscall/js` imports so they can be tested natively and quickly with `go test ./go/...`.
-- Isolate `syscall/js` glue in `go/cmd/plugin/main.go` behind `//go:build js && wasm`.
-- Every `js.FuncOf(...)` allocation must be paired with `Release()` on shutdown to avoid leaking references in the renderer process.
-- Keep the Wasm binary small (`-ldflags="-s -w"` in `build:wasm`) and avoid pulling in heavy third-party Go dependencies when the standard library suffices.
-- **Documentation**: Document every Go package with a package-level godoc overview (`// Package <name> ...`) and exported symbol godoc comments
-  as the human-readable design documentation.
+- **Manifest**: must include `id`, `name`, `version` (SemVer), `minAppVersion`, `description` and
+  `isDesktopOnly`. Never change the plugin `id` or any command ID that has shipped in a release.
+- **Mobile**: keep `isDesktopOnly: false`. Avoid Node/Electron-only APIs in `src/`.
+- **Copy**: sentence case for all setting names, descriptions, buttons, tooltips and command names
+  (enforced by `obsidianmd/ui/sentence-case`). In docs, use **bold** for literal UI labels and
+  arrows for navigation (**Settings → Community plugins**).
+- **Notices**: pass duration `0` to every `new Notice(...)` so it stays until the user dismisses it.
+- **Network**: only the Google Drive and OAuth traffic described in the design docs. Any other
+  network request needs an explicit user-facing reason and documentation.
+- **Cleanup**: register DOM, workspace and interval listeners with the `this.register*` helpers.
+- **Repo hygiene**: never commit generated or build artifacts (`main.js`, `build/`,
+  `src/*.generated.ts`, `node_modules/`).
 
-## Obsidian plugin guidelines
+## Versioning and releases
 
-### Manifest rules (`manifest.json`)
-
-- Must include `id`, `name`, `version` (SemVer `x.y.z`), `minAppVersion`, `description`, `isDesktopOnly`.
-- Never change `id` (`vaultshare`) or command IDs (`run-go-action`) after release.
-- Keep `isDesktopOnly: false`—WebAssembly runs on both desktop and mobile Obsidian; avoid Node/Electron-only APIs in `src/`.
-
-### UX & copy guidelines
-
-- **Sentence case is enforced by ESLint (`obsidianmd/ui/sentence-case`)**: Use sentence case for all `.setName()`, `.setDesc()`, `.setButtonText()`, ribbon tooltips, and command names (e.g., `'Greeting prefix'`, `'Go action'`).
-- Use **bold** for literal UI labels and arrow notation for navigation (**Settings → Community plugins**).
-- **Persistent Notices**: All `new Notice(msg, 0)` calls must pass duration `0` so Notices stay visible until dismissed by the user
-  (e.g., startup Notice when conflict resolution loads in a paused state).
-
-### Security, privacy, and resource cleanup
-
-- Default to local/offline operation; do not introduce network requests without an explicit user-facing reason and documentation.
-- Do not commit generated or build artifacts (`main.js`, `build/`, `src/settings.generated.ts`, `node_modules/`).
-- Register all DOM, workspace, and interval listeners with `this.register*` helpers (`registerEvent`, `registerDomEvent`, `registerInterval`), and ensure `onunload()` tears down the Wasm bridge cleanly.
-
-## Versioning & releases
-
-- Bump `version` in `manifest.json` (SemVer) and update `versions.json` (`npm version patch|minor|major` runs `version-bump.mjs`).
-- Create a GitHub release whose tag matches `manifest.json`'s `version` exactly (no `v` prefix) and attach `manifest.json`, `main.js`, and `styles.css`.
+- Bump the version with `npm version patch|minor|major`. This runs `version-bump.mjs` to update
+  `manifest.json` and `versions.json`.
+- The GitHub release tag must equal `manifest.json`'s `version` exactly (no `v` prefix). Attach
+  `manifest.json`, `main.js` and `styles.css`.
 
 ## References
 
-- Obsidian sample plugin: https://github.com/obsidianmd/obsidian-sample-plugin
-- Obsidian API documentation: https://docs.obsidian.md
-- Obsidian plugin guidelines: https://docs.obsidian.md/Plugins/Releasing/Plugin+guidelines
-- Go WebAssembly documentation: https://go.dev/wiki/WebAssembly
+- Obsidian developer docs: <https://docs.obsidian.md>
+- Obsidian plugin guidelines: <https://docs.obsidian.md/Plugins/Releasing/Plugin+guidelines>
+- Go WebAssembly: <https://go.dev/wiki/WebAssembly>
