@@ -1,7 +1,6 @@
 package merge
 
 import (
-	"encoding/json"
 	"fmt"
 	"path"
 	"regexp"
@@ -46,7 +45,7 @@ var (
 		segPrefix: "`===== ",
 		segSuffix: "`",
 		segRe:     regexp.MustCompile("^`===== (base|A\\d+)`$"),
-		likeRe:    regexp.MustCompile("^`(<<<<<|>>>>>|=====|\\|\\|\\|\\|\\|)`?"),
+		likeRe:    regexp.MustCompile("^`(<<<<< conflict|>>>>> conflict|===== (base|A\\d+))`$"),
 	}
 	plainSpec = markerSpec{
 		open:      PlainMarkerOpen,
@@ -54,7 +53,7 @@ var (
 		segPrefix: "===== ",
 		segSuffix: "",
 		segRe:     regexp.MustCompile("^===== (base|A\\d+)$"),
-		likeRe:    regexp.MustCompile("^(<<<<<|>>>>>|=====|\\|\\|\\|\\|\\|)"),
+		likeRe:    regexp.MustCompile("^(<<<<< conflict|>>>>> conflict|===== (base|A\\d+))$"),
 	}
 )
 
@@ -125,18 +124,25 @@ type ReconcileResult struct {
 	Changed bool   `json:"changed"`
 }
 
-// HasConflictMarkers reports whether text contains the backtick conflict-open delimiter.
+// HasConflictMarkers reports whether text contains a whole-line backtick conflict marker.
 func HasConflictMarkers(text string) bool {
 	return HasConflictMarkersWith(text, MarkerStyleBacktick)
 }
 
-// HasConflictMarkersWith reports whether text contains conflict markers for style.
+// HasConflictMarkersWith reports whether text contains any whole-line conflict marker for style.
 func HasConflictMarkersWith(text string, style MarkerStyle) bool {
-	return strings.Contains(text, specForStyle(style).open)
+	return looksLikeConflict(text, specForStyle(style))
+}
+
+func normalizeLF(text string) string {
+	if !strings.Contains(text, "\r") {
+		return text
+	}
+	return strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\r", "\n")
 }
 
 func splitLines(text string) []string {
-	return strings.Split(text, "\n")
+	return strings.Split(normalizeLF(text), "\n")
 }
 
 func joinLines(lines []string) string {
@@ -149,7 +155,12 @@ func looksLikeConflict(text string, sp markerSpec) bool {
 
 func validRegion(segs []RegionSegment) bool {
 	baseCount := 0
+	seen := make(map[string]bool, len(segs))
 	for _, s := range segs {
+		if seen[s.Label] {
+			return false
+		}
+		seen[s.Label] = true
 		if s.Label == BaseLabel {
 			baseCount++
 		}
@@ -306,39 +317,43 @@ func regionRanges(p *ParsedFile) []baseRange {
 	return ranges
 }
 
-func skeletonOf(p *ParsedFile) string {
-	type skelItem struct {
-		Kind  string   `json:"k"`
-		Lines []string `json:"l"`
+func writeLenPrefixedLines(b *strings.Builder, lines []string) {
+	b.WriteString(strconv.Itoa(len(lines)))
+	b.WriteByte('#')
+	for _, l := range lines {
+		b.WriteString(strconv.Itoa(len(l)))
+		b.WriteByte(':')
+		b.WriteString(l)
+		b.WriteByte(';')
 	}
-	items := make([]skelItem, 0, len(p.Segments))
+}
+
+func skeletonOf(p *ParsedFile) string {
+	var b strings.Builder
 	for _, s := range p.Segments {
 		if s.Kind == "stable" {
-			items = append(items, skelItem{Kind: "S", Lines: s.Lines})
+			b.WriteByte('S')
+			writeLenPrefixedLines(&b, s.Lines)
 		} else {
-			items = append(items, skelItem{Kind: "R", Lines: baseSegmentOf(s.Region)})
+			b.WriteByte('R')
+			writeLenPrefixedLines(&b, baseSegmentOf(s.Region))
 		}
 	}
-	b, _ := json.Marshal(items)
-	return string(b)
+	return b.String()
 }
 
 type contribVec = [][]string
 
 func normKey(vec contribVec, regions []*ConflictRegion) string {
-	resolved := make([][]string, len(vec))
+	var b strings.Builder
 	for i, s := range vec {
-		if s == nil {
-			resolved[i] = baseSegmentOf(regions[i])
-		} else {
-			resolved[i] = s
+		resolved := s
+		if resolved == nil {
+			resolved = baseSegmentOf(regions[i])
 		}
-		if resolved[i] == nil {
-			resolved[i] = []string{}
-		}
+		writeLenPrefixedLines(&b, resolved)
 	}
-	b, _ := json.Marshal(resolved)
-	return string(b)
+	return b.String()
 }
 
 func contributionsOf(p *ParsedFile) ([]string, map[string]contribVec) {
@@ -360,6 +375,33 @@ func contributionsOf(p *ParsedFile) ([]string, map[string]contribVec) {
 		}
 	}
 	return order, m
+}
+
+// expandParsedVersions reconstructs the full clean text for each alternative
+// contribution in a ParsedFile.
+func expandParsedVersions(p *ParsedFile) []string {
+	regions := regionsOf(p)
+	order, cmap := contributionsOf(p)
+	out := make([]string, 0, len(order))
+	for _, label := range order {
+		vec := cmap[label]
+		var lines []string
+		ri := 0
+		for _, seg := range p.Segments {
+			if seg.Kind == "stable" {
+				lines = append(lines, seg.Lines...)
+				continue
+			}
+			if vec[ri] != nil {
+				lines = append(lines, vec[ri]...)
+			} else {
+				lines = append(lines, baseSegmentOf(regions[ri])...)
+			}
+			ri++
+		}
+		out = append(out, joinLines(lines))
+	}
+	return out
 }
 
 func maxAltNumber(labels []string) int {
@@ -427,7 +469,7 @@ func localizeClean(anchor *ParsedFile, base, cleanText string) (contribVec, bool
 	shift := 0
 	bi := 0
 	for ri, r := range ranges {
-		for bi < len(blocks) && blocks[bi].Buf1Start+blocks[bi].Buf1Len <= r.start {
+		for bi < len(blocks) && blocks[bi].Buf1Start+blocks[bi].Buf1Len < r.start {
 			shift += blocks[bi].Buf2Len - blocks[bi].Buf1Len
 			bi++
 		}
@@ -449,7 +491,25 @@ func localizeClean(anchor *ParsedFile, base, cleanText string) (contribVec, bool
 }
 
 func mint(base, local, remote string, style MarkerStyle) ReconcileResult {
-	regions := Diff3Merge(splitLines(local), splitLines(base), splitLines(remote))
+	return mintMulti(splitLines(base), [][]string{splitLines(local), splitLines(remote)}, false, style)
+}
+
+// mintMulti simultaneously merges N >= 2 clean line slices against baseLines.
+// When emptyBase is true (2-way mode without an external base revision), conflict
+// regions emit an empty base segment and retain all distinct version slices.
+func mintMulti(baseLines []string, versions [][]string, emptyBase bool, style MarkerStyle) ReconcileResult {
+	k := len(versions)
+	hunks := make([][]DiffBlock, k)
+	for m := range k {
+		hunks[m] = DiffIndices(baseLines, versions[m])
+	}
+
+	idx := make([]int, k)
+	delta := make([]int, k)
+	startPos := make([]int, k)
+	used := make([]bool, k)
+	basePos := 0
+
 	var segments []Segment
 	var stable []string
 	conflicted := false
@@ -460,71 +520,160 @@ func mint(base, local, remote string, style MarkerStyle) ReconcileResult {
 		}
 	}
 
-	for _, r := range regions {
-		if r.Conflict == nil {
-			stable = append(stable, r.OK...)
-			continue
+	for {
+		bestM := -1
+		var bestStart, bestLen int
+		for m := range k {
+			if idx[m] >= len(hunks[m]) {
+				continue
+			}
+			hk := hunks[m][idx[m]]
+			if bestM == -1 || hk.Buf1Start < bestStart || (hk.Buf1Start == bestStart && hk.Buf1Len > bestLen) {
+				bestM = m
+				bestStart = hk.Buf1Start
+				bestLen = hk.Buf1Len
+			}
 		}
-		conflicted = true
-		flush()
-		segments = append(segments, Segment{
-			Kind: "region",
-			Region: &ConflictRegion{
-				Segments: []RegionSegment{
-					{Label: BaseLabel, Lines: nonNilSlice(r.Conflict.O)},
-					{Label: "A1", Lines: nonNilSlice(r.Conflict.A)},
-					{Label: "A2", Lines: nonNilSlice(r.Conflict.B)},
-				},
-			},
-		})
+		if bestM == -1 {
+			break
+		}
+
+		spanStart := bestStart
+		spanEnd := spanStart + bestLen
+		if spanStart > basePos {
+			stable = append(stable, slices.Clone(baseLines[basePos:spanStart])...)
+		}
+
+		for m := range k {
+			startPos[m] = spanStart + delta[m]
+			used[m] = false
+		}
+
+		seed := hunks[bestM][idx[bestM]]
+		used[bestM] = true
+		delta[bestM] += seed.Buf2Len - seed.Buf1Len
+		idx[bestM]++
+
+		for {
+			expanded := false
+			for m := range k {
+				for idx[m] < len(hunks[m]) {
+					hk := hunks[m][idx[m]]
+					hStart := hk.Buf1Start
+					hEnd := hStart + hk.Buf1Len
+					if !hunksOverlap(spanStart, spanEnd, hStart, hEnd) {
+						break
+					}
+					used[m] = true
+					if hEnd > spanEnd {
+						spanEnd = hEnd
+						expanded = true
+					}
+					delta[m] += hk.Buf2Len - hk.Buf1Len
+					idx[m]++
+				}
+			}
+			if !expanded {
+				break
+			}
+		}
+
+		oSlice := baseLines[spanStart:spanEnd]
+		var alts [][]string
+		for m := range k {
+			vSlice := versions[m][startPos[m] : spanEnd+delta[m]]
+			if !emptyBase && (!used[m] || slices.Equal(vSlice, oSlice)) {
+				continue
+			}
+			dup := false
+			for _, existing := range alts {
+				if slices.Equal(existing, vSlice) {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				alts = append(alts, slices.Clone(vSlice))
+			}
+		}
+
+		if !emptyBase && len(alts) == 0 {
+			stable = append(stable, slices.Clone(oSlice)...)
+		} else if len(alts) == 1 {
+			stable = append(stable, alts[0]...)
+		} else {
+			conflicted = true
+			flush()
+			baseSeg := []string{}
+			if !emptyBase {
+				baseSeg = nonNilSlice(slices.Clone(oSlice))
+			}
+			regSegs := make([]RegionSegment, 0, len(alts)+1)
+			regSegs = append(regSegs, RegionSegment{Label: BaseLabel, Lines: baseSeg})
+			for j, alt := range alts {
+				regSegs = append(regSegs, RegionSegment{
+					Label: fmt.Sprintf("A%d", j+1),
+					Lines: nonNilSlice(alt),
+				})
+			}
+			segments = append(segments, Segment{
+				Kind:   "region",
+				Region: &ConflictRegion{Segments: regSegs},
+			})
+		}
+
+		basePos = spanEnd
+	}
+
+	if basePos < len(baseLines) {
+		stable = append(stable, slices.Clone(baseLines[basePos:])...)
 	}
 	flush()
 
 	content := EmitConflictFileWith(&ParsedFile{Segments: segments}, style)
+	lastRemote := joinLines(versions[k-1])
 	if conflicted {
-		return ReconcileResult{Kind: "folded", Changed: content != remote, Content: content}
+		return ReconcileResult{Kind: "folded", Changed: content != lastRemote, Content: content}
 	}
-	return ReconcileResult{Kind: "clean", Changed: content != remote, Content: content}
+	return ReconcileResult{Kind: "clean", Changed: content != lastRemote, Content: content}
 }
 
 // mintTwoWay builds minimal whole-line conflict regions when no common base exists.
 func mintTwoWay(local, remote string, style MarkerStyle) ReconcileResult {
 	linesA := splitLines(local)
 	linesB := splitLines(remote)
-	blocks := DiffIndices(linesA, linesB)
-	if len(blocks) == 0 {
-		return ReconcileResult{Kind: "clean", Changed: false, Content: remote}
+	common := commonLCSLines([][]string{linesA, linesB})
+	res := mintMulti(common, [][]string{linesA, linesB}, true, style)
+	if res.Kind == "folded" {
+		res.Changed = true
 	}
+	return res
+}
 
-	var segments []Segment
-	curA := 0
-	for _, blk := range blocks {
-		if blk.Buf1Start > curA {
-			segments = append(segments, Segment{
-				Kind:  "stable",
-				Lines: slices.Clone(linesA[curA:blk.Buf1Start]),
-			})
+func commonLCSLines(versions [][]string) []string {
+	if len(versions) == 0 {
+		return nil
+	}
+	common := slices.Clone(versions[0])
+	for _, v := range versions[1:] {
+		blocks := DiffIndices(common, v)
+		if len(blocks) == 0 {
+			continue
 		}
-		segments = append(segments, Segment{
-			Kind: "region",
-			Region: &ConflictRegion{
-				Segments: []RegionSegment{
-					{Label: BaseLabel, Lines: []string{}},
-					{Label: "A1", Lines: nonNilSlice(slices.Clone(linesA[blk.Buf1Start : blk.Buf1Start+blk.Buf1Len]))},
-					{Label: "A2", Lines: nonNilSlice(slices.Clone(linesB[blk.Buf2Start : blk.Buf2Start+blk.Buf2Len]))},
-				},
-			},
-		})
-		curA = blk.Buf1Start + blk.Buf1Len
+		var next []string
+		cur := 0
+		for _, blk := range blocks {
+			if blk.Buf1Start > cur {
+				next = append(next, common[cur:blk.Buf1Start]...)
+			}
+			cur = blk.Buf1Start + blk.Buf1Len
+		}
+		if cur < len(common) {
+			next = append(next, common[cur:]...)
+		}
+		common = next
 	}
-	if curA < len(linesA) {
-		segments = append(segments, Segment{
-			Kind:  "stable",
-			Lines: slices.Clone(linesA[curA:]),
-		})
-	}
-	content := EmitConflictFileWith(&ParsedFile{Segments: segments}, style)
-	return ReconcileResult{Kind: "folded", Changed: true, Content: content}
+	return common
 }
 
 func nonNilSlice(in []string) []string {
@@ -597,6 +746,9 @@ func ReconcileText(base, local, remote string) ReconcileResult {
 
 // ReconcileTextWith reconciles local and remote text against base using style.
 func ReconcileTextWith(base, local, remote string, style MarkerStyle) ReconcileResult {
+	base = normalizeLF(base)
+	local = normalizeLF(local)
+	remote = normalizeLF(remote)
 	sp := specForStyle(style)
 	if local == remote {
 		return asResult(local, false, style)
@@ -641,49 +793,79 @@ func ReconcileTextWith(base, local, remote string, style MarkerStyle) ReconcileR
 	}
 
 	if !localMarked && remoteParsed != nil {
-		vec, ok := localizeClean(remoteParsed, cleanBase, local)
-		if !ok {
-			return ReconcileResult{Kind: "keepBoth"}
+		if vec, ok := localizeClean(remoteParsed, cleanBase, local); ok {
+			return foldInto(remoteParsed, remote, cleanBase, []contribVec{vec}, style)
 		}
-		return foldInto(remoteParsed, remote, cleanBase, []contribVec{vec}, style)
+		expanded := append(expandParsedVersions(remoteParsed), local)
+		return reconcileExpandedClean(cleanBase, true, expanded, remote, style)
 	}
 
 	if localParsed != nil && !remoteMarked {
-		vec, ok := localizeClean(localParsed, cleanBase, remote)
-		if !ok {
-			return ReconcileResult{Kind: "keepBoth"}
+		if vec, ok := localizeClean(localParsed, cleanBase, remote); ok {
+			r := foldInto(localParsed, local, cleanBase, []contribVec{vec}, style)
+			if r.Kind == "folded" {
+				r.Changed = true
+			}
+			return r
 		}
-		r := foldInto(localParsed, local, cleanBase, []contribVec{vec}, style)
-		if r.Kind == "folded" {
-			r.Changed = true
-		}
-		return r
+		expanded := append(expandParsedVersions(localParsed), remote)
+		return reconcileExpandedClean(cleanBase, true, expanded, remote, style)
 	}
 
 	if localParsed != nil && remoteParsed != nil {
-		if skeletonOf(localParsed) != skeletonOf(remoteParsed) {
-			return ReconcileResult{Kind: "keepBoth"}
+		if skeletonOf(localParsed) == skeletonOf(remoteParsed) {
+			lOrder, lMap := contributionsOf(localParsed)
+			incoming := make([]contribVec, 0, len(lOrder))
+			for _, label := range lOrder {
+				incoming = append(incoming, lMap[label])
+			}
+			if r := foldInto(remoteParsed, remote, cleanBase, incoming, style); r.Kind != "keepBoth" {
+				return r
+			}
 		}
-		lOrder, lMap := contributionsOf(localParsed)
-		incoming := make([]contribVec, 0, len(lOrder))
-		for _, label := range lOrder {
-			incoming = append(incoming, lMap[label])
-		}
-		return foldInto(remoteParsed, remote, cleanBase, incoming, style)
+		expanded := append(expandParsedVersions(remoteParsed), expandParsedVersions(localParsed)...)
+		return reconcileExpandedClean(cleanBase, true, expanded, remote, style)
 	}
 
 	return ReconcileResult{Kind: "keepBoth"}
 }
 
-// ReconcileVersions folds N distinct versions (e.g. local + 1..K Drive duplicates).
-// When hasBase is false, falls back to minimal 2-way diffing across versions.
-func ReconcileVersions(base string, hasBase bool, versions []string, style MarkerStyle) ReconcileResult {
+func reconcileExpandedClean(cleanBase string, hasBase bool, versions []string, compareRemote string, style MarkerStyle) ReconcileResult {
 	seen := make(map[string]bool, len(versions))
-	unique := make([]string, 0, len(versions))
+	var lineSlices [][]string
 	for _, v := range versions {
 		if !seen[v] {
 			seen[v] = true
-			unique = append(unique, v)
+			lineSlices = append(lineSlices, splitLines(v))
+		}
+	}
+	if len(lineSlices) == 0 {
+		return ReconcileResult{Kind: "clean", Content: ""}
+	}
+	if len(lineSlices) == 1 {
+		c := joinLines(lineSlices[0])
+		return asResult(c, c != compareRemote, style)
+	}
+	baseLines := splitLines(cleanBase)
+	if !hasBase {
+		baseLines = commonLCSLines(lineSlices)
+	}
+	res := mintMulti(baseLines, lineSlices, !hasBase, style)
+	res.Changed = res.Content != compareRemote
+	return res
+}
+
+// ReconcileVersions folds N distinct versions (e.g. local + 1..K Drive duplicates).
+// When hasBase is false, falls back to minimal 2-way diffing across versions.
+func ReconcileVersions(base string, hasBase bool, versions []string, style MarkerStyle) ReconcileResult {
+	base = normalizeLF(base)
+	seen := make(map[string]bool, len(versions))
+	unique := make([]string, 0, len(versions))
+	for _, v := range versions {
+		norm := normalizeLF(v)
+		if !seen[norm] {
+			seen[norm] = true
+			unique = append(unique, norm)
 		}
 	}
 	if len(unique) == 0 {
@@ -694,38 +876,50 @@ func ReconcileVersions(base string, hasBase bool, versions []string, style Marke
 	}
 
 	sp := specForStyle(style)
-	if !hasBase {
-		if len(unique) == 2 && !looksLikeConflict(unique[0], sp) && !looksLikeConflict(unique[1], sp) {
-			return mintTwoWay(unique[0], unique[1], style)
-		}
-		// Fold starting from 2-way diff of first two clean versions if possible, else keepBoth.
-		if looksLikeConflict(unique[0], sp) || looksLikeConflict(unique[1], sp) {
-			return ReconcileResult{Kind: "keepBoth"}
-		}
-		accRes := mintTwoWay(unique[0], unique[1], style)
-		parsed, ok := ParseConflictFileWith(accRes.Content, style)
+	cleanBase := base
+	if hasBase && looksLikeConflict(base, sp) {
+		bp, ok := ParseConflictFileWith(base, style)
 		if !ok {
 			return ReconcileResult{Kind: "keepBoth"}
 		}
-		synthBase := joinLines(baseReconLines(parsed))
-		acc := accRes.Content
-		for _, v := range unique[2:] {
-			step := ReconcileTextWith(synthBase, v, acc, style)
-			if step.Kind == "keepBoth" {
+		cleanBase = joinLines(baseReconLines(bp))
+	}
+
+	var expanded []string
+	anyMarked := false
+	for _, v := range unique {
+		if looksLikeConflict(v, sp) {
+			anyMarked = true
+			parsed, ok := ParseConflictFileWith(v, style)
+			if !ok {
 				return ReconcileResult{Kind: "keepBoth"}
+			}
+			expanded = append(expanded, expandParsedVersions(parsed)...)
+		} else {
+			expanded = append(expanded, v)
+		}
+	}
+
+	// Fast path when iterative folding along identical region skeletons applies cleanly.
+	if hasBase && anyMarked {
+		acc := unique[0]
+		okAll := true
+		for _, v := range unique[1:] {
+			step := ReconcileTextWith(cleanBase, acc, v, style)
+			if step.Kind == "keepBoth" {
+				okAll = false
+				break
 			}
 			acc = step.Content
 		}
-		return asResult(acc, true, style)
+		if okAll {
+			return asResult(acc, true, style)
+		}
 	}
 
-	acc := unique[0]
-	for _, v := range unique[1:] {
-		step := ReconcileTextWith(base, acc, v, style)
-		if step.Kind == "keepBoth" {
-			return ReconcileResult{Kind: "keepBoth"}
-		}
-		acc = step.Content
+	res := reconcileExpandedClean(cleanBase, hasBase, expanded, "", style)
+	if res.Kind != "keepBoth" {
+		res.Changed = true
 	}
-	return asResult(acc, true, style)
+	return res
 }

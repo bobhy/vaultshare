@@ -44,7 +44,9 @@ npm run lint         # Run ESLint (with eslint-plugin-obsidianmd)
 npm run test:go      # Run Go unit tests (go test ./go/...)
 ```
 
-Always run `npm run test:go && npm run build && npm run lint` and verify all checks pass before reporting work as done.
+Always run `npm run test:go && npm test && npm run build && npm run lint` and verify all checks pass before reporting work as done.
+
+> **Active Remediation Plan**: Multi-batch bugfix and spec-alignment checklist lives in `dev-docs/review-remediation-plan.md`. Check and update it as batches are completed.
 
 ## Architecture & file structure
 

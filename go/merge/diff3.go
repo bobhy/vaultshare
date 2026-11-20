@@ -5,6 +5,14 @@ package merge
 
 import "slices"
 
+// maxExactDPCells caps the flat 1D DP matrix used by exactLCS (262,144 cells = 1 MiB of int32).
+// Spans larger than this use Patience unique-line anchoring and linear-space Hirschberg splitting.
+const maxExactDPCells = 262_144
+
+// maxHirschbergCells caps total work on un-anchorable repetitive spans (16M cells)
+// so pathological multi-thousand-line files without unique lines never freeze Wasm.
+const maxHirschbergCells = 16_000_000
+
 // DiffBlock represents a differing hunk between two line slices (buf1 and buf2)
 // as (offset, length) pairs in half-open index space.
 type DiffBlock struct {
@@ -74,36 +82,283 @@ func lcsPairs(a, b []string) []matchPair {
 	if la == 0 || lb == 0 {
 		return nil
 	}
-	dp := make([][]int, la+1)
-	for i := range dp {
-		dp[i] = make([]int, lb+1)
+	idA, idB := internLines(a, b)
+	return lcsIDs(idA, idB, 0, 0)
+}
+
+func internLines(a, b []string) ([]int32, []int32) {
+	sym := make(map[string]int32, len(a))
+	idA := make([]int32, len(a))
+	var nextID int32 = 1
+	for i, s := range a {
+		id, ok := sym[s]
+		if !ok {
+			id = nextID
+			nextID++
+			sym[s] = id
+		}
+		idA[i] = id
 	}
+	idB := make([]int32, len(b))
+	for j, s := range b {
+		if id, ok := sym[s]; ok {
+			idB[j] = id
+		}
+	}
+	return idA, idB
+}
+
+func lcsIDs(a, b []int32, offA, offB int) []matchPair {
+	la, lb := len(a), len(b)
+	if la == 0 || lb == 0 {
+		return nil
+	}
+
+	// Trim matching prefix and suffix of this subproblem.
+	pre := 0
+	for pre < la && pre < lb && a[pre] == b[pre] {
+		pre++
+	}
+	suf := 0
+	for suf < (la-pre) && suf < (lb-pre) && a[la-1-suf] == b[lb-1-suf] {
+		suf++
+	}
+
+	var out []matchPair
+	if pre > 0 || suf > 0 {
+		out = make([]matchPair, 0, pre+suf)
+		for k := range pre {
+			out = append(out, matchPair{i: offA + k, j: offB + k})
+		}
+	}
+
+	midA := a[pre : la-suf]
+	midB := b[pre : lb-suf]
+	if len(midA) > 0 && len(midB) > 0 {
+		midPairs := lcsCore(midA, midB, offA+pre, offB+pre)
+		out = append(out, midPairs...)
+	}
+
+	for k := range suf {
+		out = append(out, matchPair{
+			i: offA + la - suf + k,
+			j: offB + lb - suf + k,
+		})
+	}
+	return out
+}
+
+func lcsCore(a, b []int32, offA, offB int) []matchPair {
+	la, lb := len(a), len(b)
+	if la == 0 || lb == 0 {
+		return nil
+	}
+	if la*lb <= maxExactDPCells {
+		return exactLCS(a, b, offA, offB)
+	}
+
+	// Split large spans on Patience unique common lines first (O(N log N)).
+	if anchors := patienceAnchors(a, b); len(anchors) > 0 {
+		var out []matchPair
+		curA, curB := 0, 0
+		for _, anc := range anchors {
+			if anc.i > curA && anc.j > curB {
+				out = append(out, lcsIDs(a[curA:anc.i], b[curB:anc.j], offA+curA, offB+curB)...)
+			}
+			out = append(out, matchPair{i: offA + anc.i, j: offB + anc.j})
+			curA = anc.i + 1
+			curB = anc.j + 1
+		}
+		if curA < la && curB < lb {
+			out = append(out, lcsIDs(a[curA:], b[curB:], offA+curA, offB+curB)...)
+		}
+		return out
+	}
+
+	if la*lb <= maxHirschbergCells {
+		fwd := make([]int32, lb+1)
+		bwd := make([]int32, lb+1)
+		return hirschbergLCS(a, b, offA, offB, fwd, bwd)
+	}
+
+	// Pathological huge un-anchorable span: coalesce as a single replacement hunk
+	// so Wasm never freezes or runs out of memory.
+	return nil
+}
+
+func exactLCS(a, b []int32, offA, offB int) []matchPair {
+	la, lb := len(a), len(b)
+	stride := lb + 1
+	dp := make([]int32, (la+1)*stride)
+
 	for i := la - 1; i >= 0; i-- {
+		row := i * stride
+		nextRow := (i + 1) * stride
+		ai := a[i]
 		for j := lb - 1; j >= 0; j-- {
-			if a[i] == b[j] {
-				dp[i][j] = dp[i+1][j+1] + 1
-			} else if dp[i+1][j] >= dp[i][j+1] {
-				dp[i][j] = dp[i+1][j]
+			if ai == b[j] {
+				dp[row+j] = dp[nextRow+j+1] + 1
+			} else if dp[nextRow+j] >= dp[row+j+1] {
+				dp[row+j] = dp[nextRow+j]
 			} else {
-				dp[i][j] = dp[i][j+1]
+				dp[row+j] = dp[row+j+1]
 			}
 		}
 	}
 
-	pairs := make([]matchPair, 0, dp[0][0])
+	pairs := make([]matchPair, 0, dp[0])
 	i, j := 0, 0
 	for i < la && j < lb {
 		if a[i] == b[j] {
-			pairs = append(pairs, matchPair{i: i, j: j})
+			pairs = append(pairs, matchPair{i: offA + i, j: offB + j})
 			i++
 			j++
-		} else if dp[i+1][j] >= dp[i][j+1] {
+		} else if dp[(i+1)*stride+j] >= dp[i*stride+j+1] {
 			i++
 		} else {
 			j++
 		}
 	}
 	return pairs
+}
+
+func hirschbergLCS(a, b []int32, offA, offB int, fwd, bwd []int32) []matchPair {
+	la, lb := len(a), len(b)
+	if la == 0 || lb == 0 {
+		return nil
+	}
+	if la*lb <= maxExactDPCells {
+		return exactLCS(a, b, offA, offB)
+	}
+	if la == 1 {
+		target := a[0]
+		for j := range lb {
+			if b[j] == target {
+				return []matchPair{{i: offA, j: offB + j}}
+			}
+		}
+		return nil
+	}
+
+	mid := la / 2
+	top := a[:mid]
+	bot := a[mid:]
+
+	// Forward LCS lengths for top[0:mid] against b[0:lb].
+	clear(fwd[:lb+1])
+	for i := range len(top) {
+		ai := top[i]
+		var prevDiag int32
+		for j := range lb {
+			temp := fwd[j+1]
+			if ai == b[j] {
+				fwd[j+1] = prevDiag + 1
+			} else if fwd[j] > fwd[j+1] {
+				fwd[j+1] = fwd[j]
+			}
+			prevDiag = temp
+		}
+	}
+
+	// Backward LCS lengths for bot[0:la-mid] against b[0:lb].
+	clear(bwd[:lb+1])
+	for i := len(bot) - 1; i >= 0; i-- {
+		ai := bot[i]
+		var prevDiag int32
+		for j := lb - 1; j >= 0; j-- {
+			temp := bwd[j]
+			if ai == b[j] {
+				bwd[j] = prevDiag + 1
+			} else if bwd[j+1] > bwd[j] {
+				bwd[j] = bwd[j+1]
+			}
+			prevDiag = temp
+		}
+	}
+
+	splitJ := 0
+	best := int32(-1)
+	for j := 0; j <= lb; j++ {
+		if score := fwd[j] + bwd[j]; score > best {
+			best = score
+			splitJ = j
+		}
+	}
+
+	left := hirschbergLCS(top, b[:splitJ], offA, offB, fwd, bwd)
+	right := hirschbergLCS(bot, b[splitJ:], offA+mid, offB+splitJ, fwd, bwd)
+	return append(left, right...)
+}
+
+// patienceAnchors returns the Longest Increasing Subsequence of lines occurring
+// exactly once in a and once in b.
+func patienceAnchors(a, b []int32) []matchPair {
+	posA := make(map[int32]int, len(a))
+	for i, id := range a {
+		if _, exists := posA[id]; exists {
+			posA[id] = -1
+		} else {
+			posA[id] = i
+		}
+	}
+	posB := make(map[int32]int, len(b))
+	for j, id := range b {
+		if pa, ok := posA[id]; !ok || pa < 0 {
+			continue
+		}
+		if _, exists := posB[id]; exists {
+			posB[id] = -1
+		} else {
+			posB[id] = j
+		}
+	}
+
+	var unique []matchPair
+	for i, id := range a {
+		if posA[id] == i {
+			if j, ok := posB[id]; ok && j >= 0 {
+				unique = append(unique, matchPair{i: i, j: j})
+			}
+		}
+	}
+	if len(unique) == 0 {
+		return nil
+	}
+
+	// Longest Increasing Subsequence over unique[k].j (since unique[k].i is strictly increasing).
+	tails := make([]int, 0, len(unique))
+	prev := make([]int, len(unique))
+	for k := range prev {
+		prev[k] = -1
+	}
+
+	for k, p := range unique {
+		lo, hi := 0, len(tails)
+		for lo < hi {
+			mid := (lo + hi) / 2
+			if unique[tails[mid]].j < p.j {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		if lo > 0 {
+			prev[k] = tails[lo-1]
+		}
+		if lo == len(tails) {
+			tails = append(tails, k)
+		} else {
+			tails[lo] = k
+		}
+	}
+
+	out := make([]matchPair, len(tails))
+	cur := tails[len(tails)-1]
+	for idx := len(tails) - 1; idx >= 0; idx-- {
+		out[idx] = unique[cur]
+		cur = prev[cur]
+	}
+	return out
 }
 
 // Diff3Merge performs a 3-way line merge of a (local) and b (remote) against o (base).
@@ -232,10 +487,10 @@ func hunksOverlap(spanStart, spanEnd, hStart, hEnd int) bool {
 		return hStart == spanStart
 	}
 	if spanStart == spanEnd {
-		return hStart < spanStart && spanStart < hEnd
+		return hStart <= spanStart && spanStart < hEnd
 	}
 	if hStart == hEnd {
-		return spanStart < hStart && hStart < spanEnd
+		return spanStart <= hStart && hStart < spanEnd
 	}
 	return hStart < spanEnd && spanStart < hEnd
 }
