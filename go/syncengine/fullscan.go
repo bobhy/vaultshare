@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"vaultshare/go/gdrive"
+	"vaultshare/go/merge"
 	"vaultshare/go/settings"
 	"vaultshare/go/syncstate"
 )
@@ -280,10 +281,43 @@ func (e *Engine) processScanFiles(
 				df.ModifiedTime == rec.LastSynced.DriveModifiedTime &&
 				localStat.Size == rec.LastSynced.Size &&
 				localStat.MTimeMs == rec.LastSynced.LocalMtimeMs {
+				if merge.IsTextMergePath(relPath) {
+					e.auditUnflaggedConflictMarkers(ctx, relPath)
+				}
 				continue
 			}
 		}
 
 		e.queue.Enqueue(relPath, PriorityBulk, "fullscan", e.now(), 0)
 	}
+}
+
+// auditUnflaggedConflictMarkers checks an otherwise clean text file during Full
+// Scan for unresolved conflict markers and flags ConflictMarkers under pathLock.
+func (e *Engine) auditUnflaggedConflictMarkers(ctx context.Context, relPath string) {
+	data, _, err := e.vault.ReadBytes(ctx, relPath)
+	if err != nil || !merge.HasConflictMarkersWith(string(data), merge.StyleForPath(relPath)) {
+		return
+	}
+	_ = e.withPathLock(ctx, relPath, func() error {
+		rec, ok := e.cache.GetFile(relPath)
+		if !ok || rec.Conflict != nil {
+			return nil
+		}
+		freshData, _, readErr := e.vault.ReadBytes(ctx, relPath)
+		if readErr != nil {
+			return nil
+		}
+		mc := e.detectMarkerConflict(relPath, freshData)
+		if mc == nil {
+			return nil
+		}
+		rec.Conflict = mc
+		rec.UpdatedAtMs = e.now().UnixMilli()
+		if err := e.cache.PutFile(ctx, rec); err != nil {
+			return err
+		}
+		e.emitGlobalStatusIfChanged()
+		return nil
+	})
 }

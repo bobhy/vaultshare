@@ -54,21 +54,21 @@ describe('ConflictMarkerNavigator & parser', () => {
 	it('parses both backtick-fenced and plain N-way conflict blocks', () => {
 		const mdLines = [
 			'intro',
-			'```<<<',
-			'```===== base',
+			'`<<<<< conflict`',
+			'`===== base`',
 			'original',
-			'```===== A1',
+			'`===== A1`',
 			'local edit',
-			'```===== A2',
+			'`===== A2`',
 			'drive edit',
-			'```>>>',
+			'`>>>>> conflict`',
 			'between',
-			'<<<<<<<',
-			'======= A1',
+			'<<<<< conflict',
+			'===== A1',
 			'plain local',
-			'======= A2',
+			'===== A2',
 			'plain drive',
-			'>>>>>>>',
+			'>>>>> conflict',
 		];
 		const blocks = parseConflictBlocks(mdLines.length, (i) => mdLines[i] ?? '');
 		expect(blocks).toHaveLength(2);
@@ -79,12 +79,12 @@ describe('ConflictMarkerNavigator & parser', () => {
 	it('navigates forward/backward with wraparound and applies chosen resolution', () => {
 		const mock = makeMockEditor([
 			'top',
-			'```<<<',
-			'```===== A1',
+			'`<<<<< conflict`',
+			'`===== A1`',
 			'first choice',
-			'```===== A2',
+			'`===== A2`',
 			'second choice',
-			'```>>>',
+			'`>>>>> conflict`',
 			'bottom',
 		]);
 		const nav = new ConflictMarkerNavigator();

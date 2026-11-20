@@ -9,19 +9,19 @@ import { type Editor, type MarkdownView, Notice, Platform, setIcon } from 'obsid
 import { type Extension, type Range, StateEffect, StateField } from '@codemirror/state';
 import { Decoration, type DecorationSet, EditorView, type Panel, showPanel } from '@codemirror/view';
 
-/** Opening conflict marker for `.md` files (backtick-fenced so Obsidian hides/fences it cleanly). */
-export const MARKER_OPEN_BACKTICK = '```<<<';
-/** Closing conflict marker for `.md` files. */
-export const MARKER_CLOSE_BACKTICK = '```>>>';
-/** Segment header pattern for backtick-fenced conflict markers (` ```===== <label> `). */
-export const SEGMENT_BACKTICK_RE = /^```===== (.+)$/;
+/** Opening conflict marker for `.md` files (inline backticks matching Go `merge.MarkerOpen`). */
+export const MARKER_OPEN_BACKTICK = '`<<<<< conflict`';
+/** Closing conflict marker for `.md` files (matching Go `merge.MarkerClose`). */
+export const MARKER_CLOSE_BACKTICK = '`>>>>> conflict`';
+/** Segment header pattern for backtick-wrapped conflict markers (`` `===== <label>` ``). */
+export const SEGMENT_BACKTICK_RE = /^`===== (.+)`$/;
 
-/** Opening conflict marker for plain-text non-Markdown files. */
-export const MARKER_OPEN_PLAIN = '<<<<<<<';
-/** Closing conflict marker for plain-text non-Markdown files. */
-export const MARKER_CLOSE_PLAIN = '>>>>>>>';
-/** Segment header pattern for plain conflict markers (`======= <label>`). */
-export const SEGMENT_PLAIN_RE = /^======= (.+)$/;
+/** Opening conflict marker for plain-text non-Markdown files (matching Go `merge.PlainMarkerOpen`). */
+export const MARKER_OPEN_PLAIN = '<<<<< conflict';
+/** Closing conflict marker for plain-text non-Markdown files (matching Go `merge.PlainMarkerClose`). */
+export const MARKER_CLOSE_PLAIN = '>>>>> conflict';
+/** Segment header pattern for plain conflict markers (`===== <label>`). */
+export const SEGMENT_PLAIN_RE = /^===== (.+)$/;
 
 /** One labelled segment of a conflict region: `base` or an alternative `A<n>`. */
 export interface ConflictSegment {

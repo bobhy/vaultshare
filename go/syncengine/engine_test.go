@@ -1260,6 +1260,19 @@ func TestConflictMarkersSurviveSubsequentResolvePathAndClearWhenResolved(t *test
 		t.Fatalf("expected ConflictMarkers preserved after follow-up resolvePath, got %+v", conflicts)
 	}
 
+	// Simulate an unflagged DB record (e.g. from pre-fix DB) whose unchanged disk
+	// content still holds conflict markers: Full Scan audit must re-flag it while
+	// resolvePath's fast path stays disk-read-free.
+	rec, _ := eng.cache.GetFile("Welcome.md")
+	rec.Conflict = nil
+	_ = eng.cache.PutFile(ctx, rec)
+	if err := eng.runFullScan(ctx); err != nil {
+		t.Fatalf("Full Scan marker audit: %v", err)
+	}
+	if got := eng.ListConflicts(); len(got) != 1 || got[0].Kind != syncstate.ConflictMarkers {
+		t.Fatalf("expected Full Scan audit to re-flag existing markers, got %+v", got)
+	}
+
 	// User resolves markers locally and saves -> follow-up resolvePath pushes clean text and clears ConflictMarkers.
 	v.SetFile("Welcome.md", "line1\nresolved edit\nline3\n", 1_700_000_000_500)
 	if err := eng.resolvePath(ctx, "Welcome.md"); err != nil {
