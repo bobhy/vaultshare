@@ -31,8 +31,8 @@ and `../test-gdoc/go/cmd/plugin/roundtripper.go`.
    `bridge.setRefreshToken(token)`. TS never stores tokens itself.
 4. **Log out** → Clear only the local `SecretStorage` key (do **not** call Google `/revoke`, which revokes the OAuth grant across all devices
    sharing that Google account).
-- Before registering the protocol handler, `onload()` runs the V1 presence check (`isVaultSharePresent`, from test-gdoc) and stays dormant
-  with a persistent Notice if vault-share is installed or enabled.
+- Before registering the protocol handler, `onload()` runs the V1 mutual-exclusion check (`isLegacyVaultShareEnabled`) and stays dormant
+  with a persistent Notice if the legacy `vault-share` plugin is enabled.
 
 ## 3. Token Management (Go, `go/gdrive/auth.go`)
 

@@ -14,12 +14,12 @@
 import { type App, normalizePath } from 'obsidian';
 import {
 	GOOGLE_CLIENT_ID,
+	LEGACY_VAULT_SHARE_PLUGIN_ID,
 	OAUTH_PROTOCOL_ACTION,
 	RELAY_BASE_URL,
-	VAULT_SHARE_PLUGIN_ID,
 } from './constants';
 
-export { GOOGLE_CLIENT_ID, OAUTH_PROTOCOL_ACTION, RELAY_BASE_URL, VAULT_SHARE_PLUGIN_ID };
+export { GOOGLE_CLIENT_ID, LEGACY_VAULT_SHARE_PLUGIN_ID, OAUTH_PROTOCOL_ACTION, RELAY_BASE_URL };
 
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const DRIVE_FILE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
@@ -36,10 +36,10 @@ interface ObsidianPluginsRegistry {
  * this vault. Installed-but-disabled `vault-share` does not conflict because it
  * is not active and does not register the shared `vault-share-auth` handler.
  */
-export async function isVaultShareEnabled(app: App): Promise<boolean> {
+export async function isLegacyVaultShareEnabled(app: App): Promise<boolean> {
 	const registry = (app as unknown as ObsidianPluginsRegistry).plugins;
 	if (registry?.enabledPlugins) {
-		return registry.enabledPlugins.has(VAULT_SHARE_PLUGIN_ID);
+		return registry.enabledPlugins.has(LEGACY_VAULT_SHARE_PLUGIN_ID);
 	}
 
 	const communityPluginsPath = normalizePath(`${app.vault.configDir}/community-plugins.json`);
@@ -49,7 +49,7 @@ export async function isVaultShareEnabled(app: App): Promise<boolean> {
 		}
 		const raw = await app.vault.adapter.read(communityPluginsPath);
 		const parsed: unknown = JSON.parse(raw);
-		return Array.isArray(parsed) && parsed.includes(VAULT_SHARE_PLUGIN_ID);
+		return Array.isArray(parsed) && parsed.includes(LEGACY_VAULT_SHARE_PLUGIN_ID);
 	} catch {
 		return false;
 	}
@@ -57,7 +57,7 @@ export async function isVaultShareEnabled(app: App): Promise<boolean> {
 
 /**
  * Computes the vault-scoped `SecretStorage` key used by VaultShare V2 so its
- * refresh token stays isolated from `vault-share` and other vaults.
+ * refresh token stays isolated from legacy `vault-share` and other vaults.
  */
 export function refreshTokenSecretKey(vaultName: string): string {
 	const safe = vaultName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'default';

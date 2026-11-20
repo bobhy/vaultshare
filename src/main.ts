@@ -6,7 +6,7 @@
  */
 
 import { MarkdownView, Notice, Plugin, TAbstractFile, TFile, TFolder } from 'obsidian';
-import { OAUTH_PROTOCOL_ACTION, OAuthFlow, isVaultShareEnabled } from './auth/oauth';
+import { OAUTH_PROTOCOL_ACTION, OAuthFlow, isLegacyVaultShareEnabled } from './auth/oauth';
 import {
 	DEFAULT_SETTINGS,
 	VaultShareSettingTab,
@@ -38,7 +38,7 @@ export default class VaultSharePlugin extends Plugin {
 
 	/** Checks V1 mutual exclusion, loads settings, and defers Wasm init until layout ready. */
 	async onload(): Promise<void> {
-		if (await isVaultShareEnabled(this.app)) {
+		if (await isLegacyVaultShareEnabled(this.app)) {
 			this.dormant = true;
 			new Notice(
 				'VaultShare cannot run while the legacy vault-share plugin is enabled. Please disable vault-share and reload VaultShare.',

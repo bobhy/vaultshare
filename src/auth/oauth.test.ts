@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { App } from 'obsidian';
 import {
+	LEGACY_VAULT_SHARE_PLUGIN_ID,
 	OAuthFlow,
-	VAULT_SHARE_PLUGIN_ID,
-	isVaultShareEnabled,
+	isLegacyVaultShareEnabled,
 	refreshTokenSecretKey,
 } from './oauth';
 
@@ -32,23 +32,23 @@ function makeMockApp(options: {
 	} as unknown as App;
 }
 
-describe('isVaultShareEnabled', () => {
+describe('isLegacyVaultShareEnabled', () => {
 	it('returns false when vault-share is absent or installed-but-disabled', async () => {
 		const app = makeMockApp({ enabledPlugins: ['other-plugin'] });
-		expect(await isVaultShareEnabled(app)).toBe(false);
+		expect(await isLegacyVaultShareEnabled(app)).toBe(false);
 	});
 
 	it('returns true when vault-share is active in enabledPlugins', async () => {
-		const app = makeMockApp({ enabledPlugins: [VAULT_SHARE_PLUGIN_ID] });
-		expect(await isVaultShareEnabled(app)).toBe(true);
+		const app = makeMockApp({ enabledPlugins: [LEGACY_VAULT_SHARE_PLUGIN_ID] });
+		expect(await isLegacyVaultShareEnabled(app)).toBe(true);
 	});
 
 	it('falls back to community-plugins.json when internal registry is absent', async () => {
 		const disabledApp = makeMockApp({ omitRegistry: true, communityPluginsJson: '["obsidian-git"]' });
-		expect(await isVaultShareEnabled(disabledApp)).toBe(false);
+		expect(await isLegacyVaultShareEnabled(disabledApp)).toBe(false);
 
 		const enabledApp = makeMockApp({ omitRegistry: true, communityPluginsJson: '["vault-share"]' });
-		expect(await isVaultShareEnabled(enabledApp)).toBe(true);
+		expect(await isLegacyVaultShareEnabled(enabledApp)).toBe(true);
 	});
 });
 

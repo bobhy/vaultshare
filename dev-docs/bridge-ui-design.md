@@ -7,7 +7,7 @@ Note: `manifest.json` has `minAppVersion: "1.13.0"` and `isDesktopOnly: false` (
 ## 1. Startup, Lifecycle & Mutual Exclusion (`src/main.ts`)
 
 1. `onload()`:
-   - Run `isVaultSharePresent(app)` (ported from `../test-gdoc/src/auth/oauth.ts`). If `vault-share` is installed or enabled, display a persistent
+   - Run `isLegacyVaultShareEnabled(app)` (see `src/auth/oauth.ts`). If legacy `vault-share` is enabled, display a persistent
      Notice (`new Notice(msg, 0)`) and abort initialization (remain dormant: no protocol handler, no Vault listeners, no Wasm load).
    - Load settings merged with `DEFAULT_SETTINGS`, register `vault-share-auth` protocol handler, CM6 extensions (`conflictHighlightExtension` and
      `lockCompartment.of(EditorView.editable.of(true))`), views (`SyncStatusView`, `LogView`, `ReconcileView`), commands, global indicator, and
@@ -120,6 +120,6 @@ Path A (`minAppVersion: "1.13.0"`): implement `getSettingDefinitions()` only (no
 
 - **`src/wasm/validators.test.ts` & `bridge.test.ts`**: Mocked `__vaultshare` validating all RPC payloads, `NeedsLogin` / `GlobalStatusEvent`,
   and clean `unload()`.
-- **`src/auth/oauth.test.ts`**: State CSRF verification, protocol callback, `isVaultSharePresent`.
+- **`src/auth/oauth.test.ts`**: State CSRF verification, protocol callback, `isLegacyVaultShareEnabled`.
 - **`src/ui/` tests**: `OpenFileLock` (non-open fast path, open-file CM6 `editable=false` + overlay cleanup on error), `GlobalStatusBar`,
   `ConflictMarkerNavigator` (backtick + plain markers), and `SyncStatusView` (countdown refresh stops on `onClose`).
