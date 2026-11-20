@@ -10,7 +10,7 @@ import {
 	ConflictMarkerNavigator,
 	parseConflictBlocks,
 } from './conflict-marker-navigator';
-import { formatLogMessage, severityRank } from './log-view';
+import { formatLogLine, formatLogMessage, severityRank } from './log-view';
 import { normalizeSyncResolutionRules } from '../settings';
 
 function makeMockEditor(initialLines: string[]): {
@@ -146,5 +146,13 @@ describe('UI configuration helpers', () => {
 				message: 'Conflict resolution paused',
 			}),
 		).toBe('Conflict resolution paused');
+		expect(
+			formatLogLine({
+				timestampMs: 1700000000000,
+				severity: 'WARNING',
+				message: 'Drive mismatch',
+				detail: 'Welcome.md',
+			}),
+		).toMatch(/WARNING Drive mismatch: Welcome\.md$/);
 	});
 });

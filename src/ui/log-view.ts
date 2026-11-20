@@ -5,7 +5,7 @@
  * @packageDocumentation
  */
 
-import { ButtonComponent, DropdownComponent, ItemView, type WorkspaceLeaf } from 'obsidian';
+import { ButtonComponent, DropdownComponent, ItemView, Notice, type WorkspaceLeaf } from 'obsidian';
 import type VaultSharePlugin from '../main';
 import type { GlobalStatusEvent, LogEntry } from '../settings.generated';
 
@@ -38,6 +38,12 @@ export function formatLogMessage(entry: LogEntry): string {
 	return detail ? `${msg}: ${detail}` : msg;
 }
 
+/** Formats a full single-line log record (`HH:MM:SS SEVERITY message: detail`) for clipboard copy. */
+export function formatLogLine(entry: LogEntry): string {
+	const ts = new Date(entry.timestampMs).toLocaleTimeString();
+	return `${ts} ${entry.severity} ${formatLogMessage(entry)}`;
+}
+
 /**
  * Displays structured sync engine logs fetched from Go's ring buffer and pushed
  * live while open.
@@ -49,6 +55,8 @@ export class LogView extends ItemView {
 	private minSeverity = 'INFO';
 	private entries: LogEntry[] = [];
 	private paused = false;
+	private streamConnected = false;
+	private connecting = false;
 
 	/** Creates a sync log workspace view bound to `plugin`. */
 	constructor(leaf: WorkspaceLeaf, plugin: VaultSharePlugin) {
@@ -105,6 +113,24 @@ export class LogView extends ItemView {
 			});
 
 		new ButtonComponent(toolbar)
+			.setButtonText('Copy')
+			.onClick(async () => {
+				const filtered = this.filteredEntries();
+				const text = filtered.reverse().map((e) => formatLogLine(e)).join('\n');
+				if (!text) {
+					new Notice('No log entries to copy.', 0);
+					return;
+				}
+				try {
+					await navigator.clipboard.writeText(text);
+					new Notice(`Copied ${filtered.length} log line(s) to clipboard.`, 0);
+				} catch (err: unknown) {
+					const msg = err instanceof Error ? err.message : String(err);
+					new Notice(`Failed to copy logs: ${msg}`, 0);
+				}
+			});
+
+		new ButtonComponent(toolbar)
 			.setButtonText('Clear')
 			.onClick(() => {
 				this.entries = [];
@@ -112,6 +138,8 @@ export class LogView extends ItemView {
 			});
 
 		this.listEl = contentEl.createDiv({ cls: 'vaultshare-log-list' });
+		this.streamConnected = false;
+		this.connecting = false;
 
 		const bridge = this.plugin.getBridge();
 		if (!bridge) {
@@ -134,29 +162,22 @@ export class LogView extends ItemView {
 				const ev = payload as GlobalStatusEvent;
 				this.paused = ev.paused;
 				this.pauseBtn?.setButtonText(this.paused ? 'Resume' : 'Pause');
+				if (!this.streamConnected) {
+					void this.connectToStream();
+				}
 			}),
 		);
 
-		try {
-			const [snap, initial] = await Promise.all([
-				bridge.getStatusSnapshot(),
-				bridge.getLogs('DEBUG'),
-			]);
-			this.paused = snap.paused;
-			this.pauseBtn.setButtonText(this.paused ? 'Resume' : 'Pause');
-			this.entries = initial;
-			this.renderEntries();
-			await bridge.setLogStream(true);
-		} catch (err: unknown) {
-			const msg = err instanceof Error ? err.message : String(err);
-			this.listEl.createDiv({ cls: 'vaultshare-error', text: `Failed to load logs: ${msg}` });
-		}
+		await this.connectToStream();
 	}
 
 	/** Disables live log streaming from Go when the panel closes. */
 	async onClose(): Promise<void> {
+		const wasConnected = this.streamConnected;
+		this.streamConnected = false;
+		this.connecting = false;
 		const bridge = this.plugin.getBridge();
-		if (bridge) {
+		if (bridge && wasConnected && this.plugin.isEngineStarted()) {
 			try {
 				await bridge.setLogStream(false);
 			} catch {
@@ -167,13 +188,57 @@ export class LogView extends ItemView {
 		this.pauseBtn = null;
 	}
 
+	private async connectToStream(): Promise<void> {
+		if (this.streamConnected || this.connecting || !this.listEl) {
+			return;
+		}
+		const bridge = this.plugin.getBridge();
+		if (!bridge || !this.plugin.isEngineStarted()) {
+			this.listEl.empty();
+			this.listEl.createDiv({
+				cls: 'vaultshare-muted',
+				text: 'Waiting for sync engine to start...',
+			});
+			return;
+		}
+
+		this.connecting = true;
+		try {
+			const [snap, initial] = await Promise.all([
+				bridge.getStatusSnapshot(),
+				bridge.getLogs('DEBUG'),
+			]);
+			if (!this.listEl) {
+				return;
+			}
+			this.paused = snap.paused;
+			this.pauseBtn?.setButtonText(this.paused ? 'Resume' : 'Pause');
+			this.entries = initial;
+			this.renderEntries();
+			await bridge.setLogStream(true);
+			this.streamConnected = true;
+		} catch (err: unknown) {
+			if (this.listEl) {
+				this.listEl.empty();
+				const msg = err instanceof Error ? err.message : String(err);
+				this.listEl.createDiv({ cls: 'vaultshare-error', text: `Failed to load logs: ${msg}` });
+			}
+		} finally {
+			this.connecting = false;
+		}
+	}
+
+	private filteredEntries(): LogEntry[] {
+		const minRank = severityRank(this.minSeverity);
+		return this.entries.filter((e) => severityRank(e.severity) >= minRank);
+	}
+
 	private renderEntries(): void {
 		if (!this.listEl) {
 			return;
 		}
 		this.listEl.empty();
-		const minRank = severityRank(this.minSeverity);
-		const filtered = this.entries.filter((e) => severityRank(e.severity) >= minRank);
+		const filtered = this.filteredEntries();
 		if (filtered.length === 0) {
 			this.listEl.createDiv({ cls: 'vaultshare-muted', text: 'No matching log entries.' });
 			return;

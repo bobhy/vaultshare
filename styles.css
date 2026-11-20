@@ -124,12 +124,16 @@
 	font-family: var(--font-monospace);
 	font-size: var(--font-smallest);
 	overflow-x: auto;
+	user-select: text;
+	-webkit-user-select: text;
 }
 
 .vaultshare-log-row {
 	border-left: 3px solid var(--background-modifier-border);
 	padding: 3px 8px;
 	white-space: nowrap;
+	user-select: text;
+	-webkit-user-select: text;
 }
 
 .vaultshare-log-row.sev-warning {

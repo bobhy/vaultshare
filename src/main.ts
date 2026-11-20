@@ -40,6 +40,7 @@ export default class VaultSharePlugin extends Plugin {
 	};
 	private markerNavigator!: ConflictMarkerNavigator;
 	private dormant = false;
+	private engineStarted = false;
 
 	/** Checks V1 mutual exclusion, loads settings, and defers Wasm init until layout ready. */
 	async onload(): Promise<void> {
@@ -114,6 +115,7 @@ export default class VaultSharePlugin extends Plugin {
 
 	/** Shuts down the Go WebAssembly runtime when the plugin is unloaded. */
 	onunload(): void {
+		this.engineStarted = false;
 		this.wasmBridge?.unload();
 		this.wasmBridge = null;
 	}
@@ -165,6 +167,11 @@ export default class VaultSharePlugin extends Plugin {
 	/** Exposes the active Wasm bridge instance for Milestone 6 workspace views. */
 	getBridge(): GoWasmBridge | null {
 		return this.wasmBridge;
+	}
+
+	/** Reports whether the Go sync engine has completed `bridge.start()`. */
+	isEngineStarted(): boolean {
+		return this.engineStarted;
 	}
 
 	/** Returns the latest known engine status (paused, needsLogin, conflictsTotal). */
@@ -339,6 +346,7 @@ export default class VaultSharePlugin extends Plugin {
 		}
 		try {
 			const status = await this.wasmBridge.start(this.settings);
+			this.engineStarted = true;
 			this.applyGlobalStatus(status);
 			this.registerVaultWatchers();
 		} catch (err: unknown) {
