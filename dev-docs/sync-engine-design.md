@@ -161,9 +161,19 @@ Every task ignores stale trigger payloads and evaluates fresh state in two phase
 - **Mobile-safe randomized restart**: On wake/start, always starts from the beginning (never skips folders based on stale checkpoints) and picks a
   randomized starting index / shuffled directory traversal order per run so partial sessions balance coverage across the vault.
 - **Audit & duplicate detection**:
-  - Walks local tree + Drive tree (`ListChildren`), updating `folders` cache and discovering duplicate-named Drive files (`len(DriveVersions) > 1`).
-  - Logs `INFO` for unknown or newer files relative to `Cache`, and `WARN` for unexpected discrepancies (e.g., disk file older than DB record).
-  - Enqueues paths needing sync/resolution at `PriorityBulk`.
+  - Runs inside the single `coordinatorLoop` serialized with `pollDriveChangesOnce` (manual `RequestFullScan` signals `scanTriggerCh`; never
+    spawns an untracked concurrent goroutine) so `folders` updates never race.
+  - Pure discovery pass: refreshes `FolderRecord`s and enqueues diverged/unknown non-busy paths at `PriorityBulk` without emitting unlocked
+    per-file discrepancy warnings; `resolvePath` (holding the exclusive per-path lock with fresh Vault, Drive, and Cache state) is the sole
+    authority that logs `WARN` discrepancies (e.g., disk file older than DB record) and duplicate Drive files.
+- **Concurrency & transactional safety**:
+  - `OnVaultEvent` routes through a single FIFO `eventRouterLoop` and enqueues rename/empty-folder-delete actions onto `workQueue.actionLane`
+    (zero Drive I/O in event ingestion; `IsPaused()`/`NeedsLogin()` apply uniformly).
+  - `ResetSyncScope` and `ClearAllState` execute under an epoch barrier (`resetEpoch`) that cancels and joins active loops, clears queues/timers,
+    resets DB, and restarts cleanly.
+  - `pullDriveFile` re-verifies local content inside `WithOpenFileLock` after editor save-flush (aborting to `pull-retry` merge on concurrent edit),
+    `pushExistingLocalFile` re-checks Drive `headRevisionId` before `UpdateFile`, and `beginLocalWrite` registers echo suppression *before* Vault
+    writes/renames.
 
 ## 6. Metrics, UI Status Delivery & Testing Matrix
 

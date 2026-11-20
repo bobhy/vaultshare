@@ -208,7 +208,9 @@ export default class VaultSharePlugin extends Plugin {
 		if (!this.wasmBridge || this.dormant) {
 			return null;
 		}
-		return await this.wasmBridge.pause();
+		const status = await this.wasmBridge.pause();
+		this.applyGlobalStatus(status);
+		return status;
 	}
 
 	/** Resumes conflict resolution and wakes Go workers/polling. */
@@ -216,7 +218,9 @@ export default class VaultSharePlugin extends Plugin {
 		if (!this.wasmBridge || this.dormant) {
 			return null;
 		}
-		return await this.wasmBridge.resume();
+		const status = await this.wasmBridge.resume();
+		this.applyGlobalStatus(status);
+		return status;
 	}
 
 	/** Triggers an immediate background Full Scan pass. */
@@ -245,7 +249,8 @@ export default class VaultSharePlugin extends Plugin {
 		if (!this.wasmBridge || this.dormant) {
 			return;
 		}
-		await this.wasmBridge.clearAllState();
+		const status = await this.wasmBridge.clearAllState();
+		this.applyGlobalStatus(status);
 		new Notice('VaultShare local sync state cleared.', 0);
 	}
 

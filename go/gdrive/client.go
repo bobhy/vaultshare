@@ -137,7 +137,7 @@ type Client struct {
 	chunkSize int // configurable for tests; defaults to 4 MiB
 
 	createMu    sync.Mutex
-	createLocks map[createKey]*sync.Mutex
+	createLocks map[createKey]chan struct{}
 }
 
 // NewClient constructs a Drive v3 Client with the provided HTTP client and TokenManager.
@@ -168,7 +168,7 @@ func NewClient(httpClient *http.Client, auth *TokenManager, retry RetryOptions) 
 		uploadBase:  defaultDriveUploadAPI,
 		retry:       retry,
 		chunkSize:   defaultResumableChunkSize,
-		createLocks: make(map[createKey]*sync.Mutex),
+		createLocks: make(map[createKey]chan struct{}),
 	}
 }
 
@@ -178,17 +178,36 @@ func (c *Client) SetEndpoints(apiBase, uploadBase string) {
 	c.uploadBase = strings.TrimRight(uploadBase, "/")
 }
 
-func (c *Client) lockCreate(parentID, name string) func() {
+// lockCreate acquires a context-aware single-flight lock for (parentID, name)
+// without holding any sync.Mutex across network I/O, and evicts the map entry
+// when released so createLocks never grows unbounded.
+func (c *Client) lockCreate(ctx context.Context, parentID, name string) (func(), error) {
 	key := createKey{parentID: parentID, name: name}
-	c.createMu.Lock()
-	mu, ok := c.createLocks[key]
-	if !ok {
-		mu = &sync.Mutex{}
-		c.createLocks[key] = mu
+	for {
+		c.createMu.Lock()
+		waitCh, busy := c.createLocks[key]
+		if !busy {
+			done := make(chan struct{})
+			c.createLocks[key] = done
+			c.createMu.Unlock()
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					c.createMu.Lock()
+					delete(c.createLocks, key)
+					close(done)
+					c.createMu.Unlock()
+				})
+			}, nil
+		}
+		c.createMu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-waitCh:
+		}
 	}
-	c.createMu.Unlock()
-	mu.Lock()
-	return mu.Unlock
 }
 
 type driveFileListResponse struct {
@@ -247,7 +266,10 @@ func (c *Client) EnsureFolderPath(ctx context.Context, rootID, relDir string) (s
 }
 
 func (c *Client) ensureSingleFolder(ctx context.Context, parentID, name string) (DriveFile, error) {
-	unlock := c.lockCreate(parentID, name)
+	unlock, err := c.lockCreate(ctx, parentID, name)
+	if err != nil {
+		return DriveFile{}, err
+	}
 	defer unlock()
 
 	matches, err := c.findChildren(ctx, parentID, name, true)

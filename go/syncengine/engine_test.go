@@ -26,11 +26,12 @@ type fakeFileEntry struct {
 }
 
 type fakeVault struct {
-	mu      sync.Mutex
-	cfgDir  string
-	files   map[string]fakeFileEntry
-	trashed map[string]fakeFileEntry
-	nowMs   int64
+	mu           sync.Mutex
+	cfgDir       string
+	files        map[string]fakeFileEntry
+	trashed      map[string]fakeFileEntry
+	nowMs        int64
+	onWriteBytes func(relPath string, mtimeMs int64)
 }
 
 func newFakeVault() *fakeVault {
@@ -99,11 +100,16 @@ func (v *fakeVault) WriteText(ctx context.Context, relPath, text string) (LocalS
 
 func (v *fakeVault) WriteBytes(_ context.Context, relPath string, data []byte) (LocalStat, error) {
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	p := normalizeRelPath(relPath)
 	v.nowMs += 100
-	v.files[p] = fakeFileEntry{data: slices.Clone(data), mtimeMs: v.nowMs}
-	return LocalStat{Path: p, Size: int64(len(data)), MTimeMs: v.nowMs}, nil
+	mtime := v.nowMs
+	v.files[p] = fakeFileEntry{data: slices.Clone(data), mtimeMs: mtime}
+	hook := v.onWriteBytes
+	v.mu.Unlock()
+	if hook != nil {
+		hook(p, mtime)
+	}
+	return LocalStat{Path: p, Size: int64(len(data)), MTimeMs: mtime}, nil
 }
 
 func (v *fakeVault) Rename(_ context.Context, oldPath, newPath string) error {
@@ -165,6 +171,9 @@ type fakeDrive struct {
 	failDownloadID   string
 	beforeCreateHook func()
 	beforeUpdateHook func(fileID string)
+	onListChildren   func(folderID string)
+	onDownloadFile   func(fileID string)
+	onGetFileMeta    func(fileID string)
 }
 
 func newFakeDrive() *fakeDrive {
@@ -267,6 +276,9 @@ func (d *fakeDrive) EnsureSyncRoot(_ context.Context, _ string) (gdrive.SyncRoot
 }
 
 func (d *fakeDrive) ListChildren(_ context.Context, folderID string) ([]gdrive.DriveFile, []gdrive.DriveFile, error) {
+	if d.onListChildren != nil {
+		d.onListChildren(folderID)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	var folders, files []gdrive.DriveFile
@@ -305,6 +317,9 @@ func (d *fakeDrive) FindInParents(_ context.Context, parentIDs []string, name st
 }
 
 func (d *fakeDrive) GetFileMeta(_ context.Context, fileID string) (gdrive.DriveFile, bool, error) {
+	if d.onGetFileMeta != nil {
+		d.onGetFileMeta(fileID)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	n, ok := d.nodes[fileID]
@@ -315,6 +330,9 @@ func (d *fakeDrive) GetFileMeta(_ context.Context, fileID string) (gdrive.DriveF
 }
 
 func (d *fakeDrive) DownloadFile(_ context.Context, fileID string) ([]byte, error) {
+	if d.onDownloadFile != nil {
+		d.onDownloadFile(fileID)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.failDownloadID != "" && d.failDownloadID == fileID {
@@ -628,6 +646,7 @@ func TestSymmetricRenameCorrelationDeleteThenCreateAndCreateThenDelete(t *testin
 		_ = eng.OnVaultEvent(ctx, settings.VaultEventPayload{Kind: "delete", Path: "old.md"})
 		v.SetFile("new.md", "same body", 1_700_000_000_200)
 		_ = eng.OnVaultEvent(ctx, settings.VaultEventPayload{Kind: "create", Path: "new.md", Size: 9, MTimeMs: 1_700_000_000_200})
+		drainQueueForTest(t, ctx, eng)
 
 		node := d.nodes[df.ID]
 		if node.file.Name != "new.md" || node.file.Trashed {
@@ -655,6 +674,7 @@ func TestSymmetricRenameCorrelationDeleteThenCreateAndCreateThenDelete(t *testin
 		_ = eng.OnVaultEvent(ctx, settings.VaultEventPayload{Kind: "create", Path: "beta.md", Size: 8, MTimeMs: 1_700_000_000_200})
 		_ = v.Trash(ctx, "alpha.md")
 		_ = eng.OnVaultEvent(ctx, settings.VaultEventPayload{Kind: "delete", Path: "alpha.md"})
+		drainQueueForTest(t, ctx, eng)
 
 		node := d.nodes[df.ID]
 		if node.file.Name != "beta.md" || node.file.Trashed {
@@ -691,6 +711,7 @@ func TestFolderRenameAndDeleteCascades(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("folder rename: %v", err)
 	}
+	drainQueueForTest(t, ctx, eng)
 	if _, ok := eng.cache.GetFile("Archive/a.md"); !ok {
 		t.Fatalf("expected Archive/a.md in cache after folder rename")
 	}
@@ -702,16 +723,7 @@ func TestFolderRenameAndDeleteCascades(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("folder delete: %v", err)
 	}
-	for {
-		task, ok := eng.queue.PopNext(false)
-		if !ok {
-			break
-		}
-		if err := eng.resolvePath(ctx, task.Path); err != nil {
-			t.Fatalf("resolvePath(%s): %v", task.Path, err)
-		}
-		eng.queue.Finish(task.Path)
-	}
+	drainQueueForTest(t, ctx, eng)
 	archFolders := eng.cache.GetFoldersByPath("Archive")
 	if len(archFolders) != 0 {
 		t.Fatalf("expected Archive folder record deleted from cache, got %+v", archFolders)
@@ -982,5 +994,238 @@ func TestFullScanPausesCleanlyAndNeedsLoginPreservesPausedState(t *testing.T) {
 		t.Fatalf("expected FullScan to populate FolderRecord cache for %s", fld.ID)
 	}
 	_ = s
+	eng.Stop()
+}
+
+func TestFullScanConcurrentPullDoesNotWarnOlder(t *testing.T) {
+	ctx := context.Background()
+	eng, v, d, _, _ := newTestEngine(t)
+	v.SetFile("Second note.md", "v1 content", 1_700_000_000_100)
+	df := d.SeedFile(d.rootID, "Second note.md", "v1 content", 1_700_000_000_100, "rev-1")
+
+	if err := eng.Start(ctx, settings.DefaultSettings(), "MyVault", false); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := eng.resolvePath(ctx, "Second note.md"); err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+
+	// Simulate an external Drive edit followed by a concurrent pull running right
+	// after Full Scan snapshots ListAllStats but before processScanFiles inspects it.
+	d.UpdateRemoteFile(df.ID, "v2 remote edit", 1_700_000_000_900)
+	var pulledOnce sync.Once
+	d.onListChildren = func(folderID string) {
+		if folderID == d.rootID {
+			pulledOnce.Do(func() {
+				if err := eng.resolvePath(ctx, "Second note.md"); err != nil {
+					t.Errorf("concurrent resolvePath: %v", err)
+				}
+			})
+		}
+	}
+
+	if err := eng.runFullScan(ctx); err != nil {
+		t.Fatalf("runFullScan: %v", err)
+	}
+
+	for _, entry := range eng.GetLogs(settings.LogWarning) {
+		if strings.Contains(entry.Message, "older than last synced state") {
+			t.Fatalf("unexpected stale-snapshot warning logged: %+v", entry)
+		}
+	}
+	txt, ok := v.GetText("Second note.md")
+	if !ok || txt != "v2 remote edit" {
+		t.Fatalf("expected updated local file content, got %q (ok=%v)", txt, ok)
+	}
+	eng.Stop()
+}
+
+func drainQueueForTest(t *testing.T, ctx context.Context, eng *Engine) {
+	t.Helper()
+	for {
+		task, ok := eng.queue.PopNext(eng.IsPaused() || eng.NeedsLogin())
+		if !ok {
+			return
+		}
+		err := eng.executeTask(ctx, task)
+		eng.completeBatchTask(ctx, task.Path, task.BatchIDs, err)
+		eng.queue.FinishTask(task)
+		if err != nil {
+			t.Fatalf("executeTask(%+v): %v", task, err)
+		}
+	}
+}
+
+func TestPullDriveFileAbortsOverwriteWhenLocalEditedDuringDownload(t *testing.T) {
+	ctx := context.Background()
+	eng, v, d, _, _ := newTestEngine(t)
+	base := "line1\nline2\nline3\n"
+	v.SetFile("live.md", base, 1_700_000_000_100)
+	df := d.SeedFile(d.rootID, "live.md", base, 1_700_000_000_100, "rev-1")
+
+	if err := eng.Start(ctx, settings.DefaultSettings(), "MyVault", false); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := eng.resolvePath(ctx, "live.md"); err != nil {
+		t.Fatalf("baseline sync: %v", err)
+	}
+
+	// Remote changes line3; while DownloadFile is in flight, user edits line1 locally.
+	d.UpdateRemoteFile(df.ID, "line1\nline2\nLINE3-DRIVE\n", 1_700_000_000_500)
+	var editedOnce sync.Once
+	d.onDownloadFile = func(fileID string) {
+		if fileID == df.ID {
+			editedOnce.Do(func() {
+				v.SetFile("live.md", "LINE1-USER\nline2\nline3\n", 1_700_000_000_600)
+			})
+		}
+	}
+
+	if err := eng.resolvePath(ctx, "live.md"); err != nil {
+		t.Fatalf("first resolvePath: %v", err)
+	}
+	// Blind overwrite must NOT have clobbered LINE1-USER; instead pull-retry was queued.
+	txt, _ := v.GetText("live.md")
+	if !strings.Contains(txt, "LINE1-USER") {
+		t.Fatalf("user edit lost during concurrent Drive pull! got:\n%s", txt)
+	}
+
+	// Next queued task runs full 3-way merge preserving BOTH edits cleanly.
+	drainQueueForTest(t, ctx, eng)
+	merged, _ := v.GetText("live.md")
+	if !strings.Contains(merged, "LINE1-USER") || !strings.Contains(merged, "LINE3-DRIVE") {
+		t.Fatalf("expected clean 3-way merge after pull-retry, got:\n%s", merged)
+	}
+	eng.Stop()
+}
+
+func TestPushExistingFileAbortsOverwriteWhenDriveChangesPreUpload(t *testing.T) {
+	ctx := context.Background()
+	eng, v, d, _, _ := newTestEngine(t)
+	base := "top\nmid\nbot\n"
+	v.SetFile("push.md", base, 1_700_000_000_100)
+	df := d.SeedFile(d.rootID, "push.md", base, 1_700_000_000_100, "rev-1")
+
+	if err := eng.Start(ctx, settings.DefaultSettings(), "MyVault", false); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := eng.resolvePath(ctx, "push.md"); err != nil {
+		t.Fatalf("baseline sync: %v", err)
+	}
+
+	// User edits top locally; right before UpdateFile, Drive updates bot remotely.
+	v.SetFile("push.md", "TOP-LOCAL\nmid\nbot\n", 1_700_000_000_400)
+	var updatedOnce sync.Once
+	d.onGetFileMeta = func(fileID string) {
+		if fileID == df.ID {
+			updatedOnce.Do(func() {
+				d.UpdateRemoteFile(df.ID, "top\nmid\nBOT-DRIVE\n", 1_700_000_000_450)
+			})
+		}
+	}
+
+	if err := eng.resolvePath(ctx, "push.md"); err != nil {
+		t.Fatalf("first resolvePath: %v", err)
+	}
+	// Pre-upload check must have detected rev mismatch and queued push-retry -> 3-way merge.
+	drainQueueForTest(t, ctx, eng)
+	merged, _ := v.GetText("push.md")
+	if !strings.Contains(merged, "TOP-LOCAL") || !strings.Contains(merged, "BOT-DRIVE") {
+		t.Fatalf("expected 3-way merge preserving Drive edit, got:\n%s", merged)
+	}
+	eng.Stop()
+}
+
+func TestPreWriteEchoSuppressionDuringVaultWrite(t *testing.T) {
+	ctx := context.Background()
+	eng, v, d, _, _ := newTestEngine(t)
+	d.SeedFile(d.rootID, "echo.md", "from drive", 1_700_000_000_100, "rev-1")
+
+	if err := eng.Start(ctx, settings.DefaultSettings(), "MyVault", false); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Simulate Obsidian firing vault.on('modify') synchronously inside WriteText!
+	v.onWriteBytes = func(relPath string, mtimeMs int64) {
+		_ = eng.OnVaultEvent(ctx, settings.VaultEventPayload{
+			Kind:    "modify",
+			Path:    relPath,
+			MTimeMs: mtimeMs,
+		})
+	}
+
+	if err := eng.resolvePath(ctx, "echo.md"); err != nil {
+		t.Fatalf("resolvePath(echo.md): %v", err)
+	}
+	if flushed := eng.FlushDebounces(); flushed != 0 {
+		t.Fatalf("expected synchronous echo inside WriteText suppressed, got %d debounced edits", flushed)
+	}
+	eng.Stop()
+}
+
+func TestFIFORenameOrderingAndPauseGating(t *testing.T) {
+	ctx := context.Background()
+	eng, v, d, _, _ := newTestEngine(t)
+	v.SetFile("a.md", "chain", 1_700_000_000_100)
+	df := d.SeedFile(d.rootID, "a.md", "chain", 1_700_000_000_100, "rev-1")
+	emptyFld := d.SeedFolder(d.rootID, "EmptyDir")
+
+	if err := eng.Start(ctx, settings.DefaultSettings(), "MyVault", false); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	_ = eng.cache.PutFolders(ctx, []syncstate.FolderRecord{{
+		DriveFolderID: emptyFld.ID,
+		ParentID:      d.rootID,
+		Name:          "EmptyDir",
+		Path:          "EmptyDir",
+	}})
+	if err := eng.resolvePath(ctx, "a.md"); err != nil {
+		t.Fatalf("sync a.md: %v", err)
+	}
+
+	// Pause must prevent empty folder delete from touching Drive!
+	_ = eng.Pause(ctx)
+	_ = eng.OnVaultEvent(ctx, settings.VaultEventPayload{Kind: "delete", Path: "EmptyDir", IsFolder: true})
+	drainQueueForTest(t, ctx, eng)
+	if d.nodes[emptyFld.ID].file.Trashed {
+		t.Fatalf("empty Drive folder must NOT be trashed while engine is paused")
+	}
+
+	// Resume -> empty folder trash runs, and rapid rename chain a->b->c executes FIFO!
+	_ = eng.Resume(ctx)
+	_ = v.Rename(ctx, "a.md", "b.md")
+	_ = eng.OnVaultEvent(ctx, settings.VaultEventPayload{Kind: "rename", OldPath: "a.md", Path: "b.md"})
+	_ = v.Rename(ctx, "b.md", "c.md")
+	_ = eng.OnVaultEvent(ctx, settings.VaultEventPayload{Kind: "rename", OldPath: "b.md", Path: "c.md"})
+	drainQueueForTest(t, ctx, eng)
+
+	if !d.nodes[emptyFld.ID].file.Trashed {
+		t.Fatalf("expected EmptyDir trashed after Resume")
+	}
+	if d.nodes[df.ID].file.Name != "c.md" {
+		t.Fatalf("expected Drive file renamed a->b->c to c.md, got %q", d.nodes[df.ID].file.Name)
+	}
+	if _, ok := eng.cache.GetFile("c.md"); !ok {
+		t.Fatalf("expected cache record at c.md")
+	}
+	eng.Stop()
+}
+
+func TestEpochResetHaltsOldWorkersAndClearsQueue(t *testing.T) {
+	ctx := context.Background()
+	eng, v, d, _, _ := newTestEngine(t)
+	v.SetFile("reset.md", "hello", 1_700_000_000_100)
+	d.SeedFile(d.rootID, "reset.md", "hello", 1_700_000_000_100, "rev-1")
+
+	if err := eng.Start(ctx, settings.DefaultSettings(), "MyVault", true); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Trigger ClearAllState while background workers/coordinator/router are live.
+	if err := eng.ClearAllState(ctx); err != nil {
+		t.Fatalf("ClearAllState: %v", err)
+	}
+	if len(eng.cache.ListFiles()) != 0 {
+		t.Fatalf("expected empty file cache immediately after ClearAllState")
+	}
 	eng.Stop()
 }

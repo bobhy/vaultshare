@@ -92,6 +92,38 @@ func computeHashes(data []byte) (sha256Hex, md5Hex string) {
 	return hex.EncodeToString(s[:]), hex.EncodeToString(m[:])
 }
 
+// beginLocalWrite registers an active Vault write/rename BEFORE invoking Obsidian's
+// Vault API so synchronous/microtask watcher echoes are immediately suppressed.
+// Call the returned finisher after the write completes.
+func (e *Engine) beginLocalWrite(relPath string) func(ok bool, md5Hex string, mtimeMs int64) {
+	e.echoMu.Lock()
+	e.inFlightLocalWrites[relPath]++
+	e.echoMu.Unlock()
+
+	var finished bool
+	return func(ok bool, md5Hex string, mtimeMs int64) {
+		e.echoMu.Lock()
+		if finished {
+			e.echoMu.Unlock()
+			return
+		}
+		finished = true
+		if cur := e.inFlightLocalWrites[relPath] - 1; cur <= 0 {
+			delete(e.inFlightLocalWrites, relPath)
+		} else {
+			e.inFlightLocalWrites[relPath] = cur
+		}
+		if ok {
+			e.recentLocalWrites[relPath] = echoEntry{
+				expiresAt: e.now().Add(echoTTL),
+				md5Hex:    md5Hex,
+				mtimeMs:   mtimeMs,
+			}
+		}
+		e.echoMu.Unlock()
+	}
+}
+
 // recordLocalEcho suppresses watcher echo events triggered by our own Vault writes.
 func (e *Engine) recordLocalEcho(relPath, md5Hex string, mtimeMs int64) {
 	e.echoMu.Lock()
@@ -107,6 +139,9 @@ func (e *Engine) consumeLocalEcho(relPath string, mtimeMs int64) bool {
 	now := e.now()
 	e.echoMu.Lock()
 	defer e.echoMu.Unlock()
+	if e.inFlightLocalWrites[relPath] > 0 {
+		return true
+	}
 	ent, ok := e.recentLocalWrites[relPath]
 	if !ok {
 		return false
@@ -153,8 +188,35 @@ func (e *Engine) consumeDriveEcho(fileID, md5Hex string) bool {
 	return false
 }
 
-// OnVaultEvent ingests a local Obsidian Vault or Workspace event.
+// OnVaultEvent ingests a local Obsidian Vault or Workspace event in strict FIFO
+// order without executing Drive network I/O on the event RPC goroutine.
 func (e *Engine) OnVaultEvent(ctx context.Context, ev settings.VaultEventPayload) error {
+	e.epochMu.Lock()
+	routerActive := e.epochCancel != nil
+	e.epochMu.Unlock()
+
+	if routerActive {
+		done := make(chan error, 1)
+		req := vaultEventReq{ctx: ctx, ev: ev, done: done}
+		select {
+		case e.eventCh <- req:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		select {
+		case err := <-done:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	e.eventIngestMu.Lock()
+	defer e.eventIngestMu.Unlock()
+	return e.processVaultEventOrdered(ctx, ev)
+}
+
+func (e *Engine) processVaultEventOrdered(ctx context.Context, ev settings.VaultEventPayload) error {
 	relPath := normalizeRelPath(ev.Path)
 	if isExcludedPath(relPath, e.vault.ConfigDir()) {
 		return nil
@@ -174,10 +236,30 @@ func (e *Engine) OnVaultEvent(ctx context.Context, ev settings.VaultEventPayload
 		if oldPath == "" || oldPath == relPath || isExcludedPath(oldPath, e.vault.ConfigDir()) {
 			return nil
 		}
-		if ev.IsFolder {
-			return e.handleLocalFolderRename(ctx, oldPath, relPath)
+		if e.consumeLocalEcho(relPath, ev.MTimeMs) {
+			return nil
 		}
-		return e.handleLocalFileRename(ctx, oldPath, relPath)
+		if ev.IsFolder {
+			e.queue.EnqueueAction(SyncTask{
+				Kind:       TaskLocalFolderRename,
+				OldPath:    oldPath,
+				Path:       relPath,
+				Source:     "folder-rename",
+				EnqueuedAt: e.now(),
+			})
+			return nil
+		}
+		e.cancelDebounce(oldPath)
+		e.cancelDebounce(relPath)
+		e.consumeInSessionDelete(oldPath)
+		e.queue.EnqueueAction(SyncTask{
+			Kind:       TaskLocalRename,
+			OldPath:    oldPath,
+			Path:       relPath,
+			Source:     "rename",
+			EnqueuedAt: e.now(),
+		})
+		return nil
 
 	case "create":
 		if ev.IsFolder {
@@ -211,7 +293,12 @@ func (e *Engine) OnVaultEvent(ctx context.Context, ev settings.VaultEventPayload
 				e.queue.Enqueue(rec.Path, PriorityHigh, "folder-delete", e.now(), 0)
 			}
 			if len(descendants) == 0 {
-				e.trashDriveFolderIfEmpty(ctx, relPath)
+				e.queue.EnqueueAction(SyncTask{
+					Kind:       TaskTrashEmptyFolder,
+					Path:       relPath,
+					Source:     "folder-delete",
+					EnqueuedAt: e.now(),
+				})
 			}
 			return nil
 		}
@@ -227,6 +314,9 @@ func (e *Engine) OnVaultEvent(ctx context.Context, ev settings.VaultEventPayload
 }
 
 func (e *Engine) trashDriveFolderIfEmpty(ctx context.Context, relDir string) {
+	if e.IsPaused() || e.NeedsLogin() {
+		return
+	}
 	relDir = normalizeRelPath(relDir)
 	if relDir == "" || isExcludedPath(relDir, e.vault.ConfigDir()) {
 		return
@@ -242,8 +332,8 @@ func (e *Engine) trashDriveFolderIfEmpty(ctx context.Context, relDir string) {
 		if err != nil || len(subFolders) > 0 || len(subFiles) > 0 {
 			continue
 		}
+		e.recordDriveEcho(fld.DriveFolderID, "")
 		if err := e.drive.TrashFile(ctx, fld.DriveFolderID); err == nil {
-			e.recordDriveEcho(fld.DriveFolderID, "")
 			_ = e.cache.DeleteFolder(ctx, fld.DriveFolderID)
 		}
 	}
@@ -329,6 +419,27 @@ func (e *Engine) FlushDebounces() int {
 	now := e.now()
 	for _, p := range paths {
 		e.queue.Enqueue(p, PriorityHigh, "flush", now, 0)
+	}
+	return len(paths)
+}
+
+// FlushPendingDeletes releases any held rename-correlation deletes onto the
+// High-priority queue immediately (used before app suspend/sleep).
+func (e *Engine) FlushPendingDeletes() int {
+	e.renameMu.Lock()
+	paths := make([]string, 0, len(e.pendingDeletes))
+	for p, del := range e.pendingDeletes {
+		if del.timer != nil {
+			del.timer.Stop()
+		}
+		paths = append(paths, p)
+	}
+	clear(e.pendingDeletes)
+	e.renameMu.Unlock()
+
+	now := e.now()
+	for _, p := range paths {
+		e.queue.Enqueue(p, PriorityHigh, "flush-delete", now, 0)
 	}
 	return len(paths)
 }
@@ -421,7 +532,14 @@ func (e *Engine) tryMatchCreateWithPendingDelete(ctx context.Context, newPath st
 	}
 
 	e.cancelDebounce(newPath)
-	_ = e.handleLocalFileRename(ctx, matched.path, newPath)
+	e.consumeInSessionDelete(matched.path)
+	e.queue.EnqueueAction(SyncTask{
+		Kind:       TaskLocalRename,
+		OldPath:    matched.path,
+		Path:       newPath,
+		Source:     "correlated-rename",
+		EnqueuedAt: e.now(),
+	})
 	return true
 }
 
@@ -455,7 +573,14 @@ func (e *Engine) tryMatchDeleteWithPendingCreate(ctx context.Context, oldPath st
 		delete(e.pendingCreates, cand.path)
 		e.renameMu.Unlock()
 		e.cancelDebounce(cand.path)
-		_ = e.handleLocalFileRename(ctx, oldPath, cand.path)
+		e.consumeInSessionDelete(oldPath)
+		e.queue.EnqueueAction(SyncTask{
+			Kind:       TaskLocalRename,
+			OldPath:    oldPath,
+			Path:       cand.path,
+			Source:     "correlated-rename",
+			EnqueuedAt: e.now(),
+		})
 		return true
 	}
 	return false
@@ -476,6 +601,12 @@ func (e *Engine) handleLocalFileRename(ctx context.Context, oldPath, newPath str
 	e.cancelDebounce(newPath)
 	e.consumeInSessionDelete(oldPath)
 
+	return e.withPathLocks(ctx, []string{oldPath, newPath}, func() error {
+		return e.handleLocalFileRenameLocked(ctx, oldPath, newPath)
+	})
+}
+
+func (e *Engine) handleLocalFileRenameLocked(ctx context.Context, oldPath, newPath string) error {
 	rec, ok := e.cache.GetFile(oldPath)
 	if !ok || rec.LastSynced == nil || rec.LastSynced.DriveFileID == "" || e.IsPaused() || e.NeedsLogin() {
 		e.queue.Enqueue(oldPath, PriorityHigh, "rename-old", e.now(), 0)
@@ -844,11 +975,22 @@ func (e *Engine) handleKnownDriveFolderChange(
 		for _, rec := range e.cache.ListDescendantFiles(oldPath) {
 			suffix := strings.TrimPrefix(rec.Path, oldPath)
 			dstPath := normalizeRelPath(newPath + suffix)
-			if err := e.vault.Rename(ctx, rec.Path, dstPath); err == nil {
-				e.recordLocalEcho(dstPath, "", 0)
-				_ = e.cache.MigrateFilePath(ctx, rec.Path, dstPath, rec)
-			} else {
-				affectedPaths[rec.Path] = true
+			oldChildPath := rec.Path
+			err := e.withPathLocks(ctx, []string{oldChildPath, dstPath}, func() error {
+				latestRec, ok := e.cache.GetFile(oldChildPath)
+				if !ok {
+					return nil
+				}
+				endEcho := e.beginLocalWrite(dstPath)
+				if err := e.vault.Rename(ctx, oldChildPath, dstPath); err != nil {
+					endEcho(false, "", 0)
+					return err
+				}
+				endEcho(true, "", 0)
+				return e.cache.MigrateFilePath(ctx, oldChildPath, dstPath, latestRec)
+			})
+			if err != nil {
+				affectedPaths[oldChildPath] = true
 				affectedPaths[dstPath] = true
 			}
 		}
@@ -896,18 +1038,27 @@ func (e *Engine) collectDriveSubtreePaths(ctx context.Context, folderID, relDir 
 }
 
 func (e *Engine) mirrorDriveRenameLocally(ctx context.Context, prev syncstate.FileRecord, moved gdrive.DriveFile, newPath string) error {
-	if err := e.vault.Rename(ctx, prev.Path, newPath); err != nil {
-		return err
-	}
-	e.recordLocalEcho(newPath, "", 0)
-	prev.DriveVersions = []syncstate.DriveVersionState{driveFileToState(moved)}
-	prev.UpdatedAtMs = e.now().UnixMilli()
-	if err := e.cache.MigrateFilePath(ctx, prev.Path, newPath, prev); err != nil {
-		return err
-	}
-	e.metrics.IncResolution(func(c *settings.ResolutionCounters) { c.Renamed++ })
-	e.log(settings.LogInfo, "Mirrored Drive rename locally", prev.Path+" -> "+newPath)
-	return nil
+	oldPath := prev.Path
+	return e.withPathLocks(ctx, []string{oldPath, newPath}, func() error {
+		latest, ok := e.cache.GetFile(oldPath)
+		if !ok {
+			return nil
+		}
+		endEcho := e.beginLocalWrite(newPath)
+		if err := e.vault.Rename(ctx, oldPath, newPath); err != nil {
+			endEcho(false, "", 0)
+			return err
+		}
+		endEcho(true, "", 0)
+		latest.DriveVersions = []syncstate.DriveVersionState{driveFileToState(moved)}
+		latest.UpdatedAtMs = e.now().UnixMilli()
+		if err := e.cache.MigrateFilePath(ctx, oldPath, newPath, latest); err != nil {
+			return err
+		}
+		e.metrics.IncResolution(func(c *settings.ResolutionCounters) { c.Renamed++ })
+		e.log(settings.LogInfo, "Mirrored Drive rename locally", oldPath+" -> "+newPath)
+		return nil
+	})
 }
 
 func (e *Engine) completeBatchTask(ctx context.Context, path string, batchIDs []uint64, taskErr error) {

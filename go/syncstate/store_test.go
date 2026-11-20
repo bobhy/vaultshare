@@ -2,7 +2,9 @@ package syncstate
 
 import (
 	"context"
+	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 )
 
@@ -155,5 +157,49 @@ func TestCacheMetaRoundTripAndResetSyncScope(t *testing.T) {
 	}
 	if reloaded.ClientID().ID != "client-uuid" || !reloaded.EngineState().Paused {
 		t.Fatal("clientId or engineState lost during ResetSyncScope")
+	}
+}
+
+func TestCacheWriteGatePreventsStoreMemoryInversion(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	cache := NewCache(store)
+	if err := cache.LoadAll(ctx); err != nil {
+		t.Fatalf("LoadAll: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			rec := FileRecord{
+				Path:        "shared.md",
+				UpdatedAtMs: int64(n),
+				LastSynced: &SyncedBaseline{
+					DriveFileID: fmt.Sprintf("f-%d", n),
+				},
+			}
+			if err := cache.PutFile(ctx, rec); err != nil {
+				t.Errorf("PutFile(%d): %v", n, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	cached, ok := cache.GetFile("shared.md")
+	if !ok {
+		t.Fatal("expected shared.md in Cache")
+	}
+	reloaded := NewCache(store)
+	if err := reloaded.LoadAll(ctx); err != nil {
+		t.Fatalf("reloaded.LoadAll: %v", err)
+	}
+	persisted, ok := reloaded.GetFile("shared.md")
+	if !ok {
+		t.Fatal("expected shared.md in Store")
+	}
+	if !reflect.DeepEqual(cached, persisted) {
+		t.Fatalf("Store/Cache diverged: cached=%+v persisted=%+v", cached, persisted)
 	}
 }

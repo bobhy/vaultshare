@@ -15,9 +15,12 @@ import (
 const maxFolderWalkDepth = 128
 
 // Cache maintains an in-memory write-through projection of all 3 IndexedDB stores
-// and secondary lookup indexes. Cache.mu is never held across Store I/O calls.
+// and secondary lookup indexes. All Store+Cache writes serialize through writeGate
+// (a context-aware channel semaphore, never holding sync.Mutex across Store I/O)
+// so IndexedDB and memory never diverge under concurrent callers.
 type Cache struct {
-	store Store
+	store     Store
+	writeGate chan struct{}
 
 	mu            sync.RWMutex
 	filesByPath   map[string]FileRecord
@@ -37,6 +40,7 @@ type Cache struct {
 func NewCache(store Store) *Cache {
 	return &Cache{
 		store:         store,
+		writeGate:     make(chan struct{}, 1),
 		filesByPath:   make(map[string]FileRecord),
 		driveIDToPath: make(map[string]string),
 		foldersByID:   make(map[string]FolderRecord),
@@ -45,8 +49,24 @@ func NewCache(store Store) *Cache {
 	}
 }
 
+func (c *Cache) withWriteGate(ctx context.Context, fn func() error) error {
+	select {
+	case c.writeGate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-c.writeGate }()
+	return fn()
+}
+
 // LoadAll reads all rows from Store and populates in-memory indexes.
 func (c *Cache) LoadAll(ctx context.Context) error {
+	return c.withWriteGate(ctx, func() error {
+		return c.loadAllLocked(ctx)
+	})
+}
+
+func (c *Cache) loadAllLocked(ctx context.Context) error {
 	snap, err := c.store.LoadAll(ctx)
 	if err != nil {
 		return err
@@ -200,57 +220,63 @@ func (c *Cache) ListDescendantFiles(dirPath string) []FileRecord {
 
 // PutFile persists rec to Store first, then updates in-memory maps and indexes.
 func (c *Cache) PutFile(ctx context.Context, rec FileRecord) error {
-	NormalizeFileRecord(&rec)
-	if err := c.store.PutFile(ctx, rec); err != nil {
-		return err
-	}
+	return c.withWriteGate(ctx, func() error {
+		NormalizeFileRecord(&rec)
+		if err := c.store.PutFile(ctx, rec); err != nil {
+			return err
+		}
 
-	c.mu.Lock()
-	if old, exists := c.filesByPath[rec.Path]; exists {
-		c.removeFileIndexesLocked(old)
-	}
-	c.filesByPath[rec.Path] = cloneFileRecord(rec)
-	c.addFileIndexesLocked(rec)
-	c.mu.Unlock()
-	return nil
+		c.mu.Lock()
+		if old, exists := c.filesByPath[rec.Path]; exists {
+			c.removeFileIndexesLocked(old)
+		}
+		c.filesByPath[rec.Path] = cloneFileRecord(rec)
+		c.addFileIndexesLocked(rec)
+		c.mu.Unlock()
+		return nil
+	})
 }
 
 // DeleteFile deletes path from Store first, then updates in-memory maps and indexes.
 func (c *Cache) DeleteFile(ctx context.Context, path string) error {
-	if err := c.store.DeleteFile(ctx, path); err != nil {
-		return err
-	}
+	return c.withWriteGate(ctx, func() error {
+		if err := c.store.DeleteFile(ctx, path); err != nil {
+			return err
+		}
 
-	c.mu.Lock()
-	if old, exists := c.filesByPath[path]; exists {
-		c.removeFileIndexesLocked(old)
-		delete(c.filesByPath, path)
-	}
-	c.mu.Unlock()
-	return nil
+		c.mu.Lock()
+		if old, exists := c.filesByPath[path]; exists {
+			c.removeFileIndexesLocked(old)
+			delete(c.filesByPath, path)
+		}
+		c.mu.Unlock()
+		return nil
+	})
 }
 
 // MigrateFilePath atomically moves oldPath to newPath in Store first, then updates
 // filesByPath, driveIDToPath, and conflictPaths in memory.
 func (c *Cache) MigrateFilePath(ctx context.Context, oldPath, newPath string, updated FileRecord) error {
-	updated.Path = newPath
-	NormalizeFileRecord(&updated)
-	if err := c.store.MigrateFilePath(ctx, oldPath, newPath, updated); err != nil {
-		return err
-	}
+	return c.withWriteGate(ctx, func() error {
+		updated.Path = newPath
+		NormalizeFileRecord(&updated)
+		if err := c.store.MigrateFilePath(ctx, oldPath, newPath, updated); err != nil {
+			return err
+		}
 
-	c.mu.Lock()
-	if old, exists := c.filesByPath[oldPath]; exists {
-		c.removeFileIndexesLocked(old)
-		delete(c.filesByPath, oldPath)
-	}
-	if prevTarget, exists := c.filesByPath[newPath]; exists {
-		c.removeFileIndexesLocked(prevTarget)
-	}
-	c.filesByPath[newPath] = cloneFileRecord(updated)
-	c.addFileIndexesLocked(updated)
-	c.mu.Unlock()
-	return nil
+		c.mu.Lock()
+		if old, exists := c.filesByPath[oldPath]; exists {
+			c.removeFileIndexesLocked(old)
+			delete(c.filesByPath, oldPath)
+		}
+		if prevTarget, exists := c.filesByPath[newPath]; exists {
+			c.removeFileIndexesLocked(prevTarget)
+		}
+		c.filesByPath[newPath] = cloneFileRecord(updated)
+		c.addFileIndexesLocked(updated)
+		c.mu.Unlock()
+		return nil
+	})
 }
 
 func (c *Cache) addFileIndexesLocked(rec FileRecord) {
@@ -344,30 +370,34 @@ func (c *Cache) PutFolders(ctx context.Context, folders []FolderRecord) error {
 	if len(folders) == 0 {
 		return nil
 	}
-	if err := c.store.PutFolders(ctx, folders); err != nil {
-		return err
-	}
+	return c.withWriteGate(ctx, func() error {
+		if err := c.store.PutFolders(ctx, folders); err != nil {
+			return err
+		}
 
-	c.mu.Lock()
-	for _, f := range folders {
-		c.foldersByID[f.DriveFolderID] = f
-	}
-	c.foldersByPath = rebuildFoldersByPath(c.foldersByID)
-	c.mu.Unlock()
-	return nil
+		c.mu.Lock()
+		for _, f := range folders {
+			c.foldersByID[f.DriveFolderID] = f
+		}
+		c.foldersByPath = rebuildFoldersByPath(c.foldersByID)
+		c.mu.Unlock()
+		return nil
+	})
 }
 
 // DeleteFolder removes driveFolderID from Store and updates folder indexes.
 func (c *Cache) DeleteFolder(ctx context.Context, driveFolderID string) error {
-	if err := c.store.DeleteFolder(ctx, driveFolderID); err != nil {
-		return err
-	}
+	return c.withWriteGate(ctx, func() error {
+		if err := c.store.DeleteFolder(ctx, driveFolderID); err != nil {
+			return err
+		}
 
-	c.mu.Lock()
-	delete(c.foldersByID, driveFolderID)
-	c.foldersByPath = rebuildFoldersByPath(c.foldersByID)
-	c.mu.Unlock()
-	return nil
+		c.mu.Lock()
+		delete(c.foldersByID, driveFolderID)
+		c.foldersByPath = rebuildFoldersByPath(c.foldersByID)
+		c.mu.Unlock()
+		return nil
+	})
 }
 
 // ResolveFolderPath walks ParentID links in memory from folderID up to the
@@ -411,13 +441,15 @@ func (c *Cache) SyncRoot() SyncRootMeta {
 
 // PutSyncRoot persists SyncRootMeta and updates the cache.
 func (c *Cache) PutSyncRoot(ctx context.Context, meta SyncRootMeta) error {
-	if err := c.store.PutMeta(ctx, MetaKeySyncRoot, meta); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	c.syncRoot = meta
-	c.mu.Unlock()
-	return nil
+	return c.withWriteGate(ctx, func() error {
+		if err := c.store.PutMeta(ctx, MetaKeySyncRoot, meta); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		c.syncRoot = meta
+		c.mu.Unlock()
+		return nil
+	})
 }
 
 // ChangeToken returns the cached ChangeTokenMeta.
@@ -429,13 +461,15 @@ func (c *Cache) ChangeToken() ChangeTokenMeta {
 
 // PutChangeToken persists ChangeTokenMeta and updates the cache.
 func (c *Cache) PutChangeToken(ctx context.Context, meta ChangeTokenMeta) error {
-	if err := c.store.PutMeta(ctx, MetaKeyChangeToken, meta); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	c.changeToken = meta
-	c.mu.Unlock()
-	return nil
+	return c.withWriteGate(ctx, func() error {
+		if err := c.store.PutMeta(ctx, MetaKeyChangeToken, meta); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		c.changeToken = meta
+		c.mu.Unlock()
+		return nil
+	})
 }
 
 // EngineState returns the cached EngineStateMeta.
@@ -447,13 +481,15 @@ func (c *Cache) EngineState() EngineStateMeta {
 
 // PutEngineState persists EngineStateMeta and updates the cache.
 func (c *Cache) PutEngineState(ctx context.Context, meta EngineStateMeta) error {
-	if err := c.store.PutMeta(ctx, MetaKeyEngineState, meta); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	c.engineState = meta
-	c.mu.Unlock()
-	return nil
+	return c.withWriteGate(ctx, func() error {
+		if err := c.store.PutMeta(ctx, MetaKeyEngineState, meta); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		c.engineState = meta
+		c.mu.Unlock()
+		return nil
+	})
 }
 
 // ClientID returns the cached ClientIDMeta.
@@ -465,13 +501,15 @@ func (c *Cache) ClientID() ClientIDMeta {
 
 // PutClientID persists ClientIDMeta and updates the cache.
 func (c *Cache) PutClientID(ctx context.Context, meta ClientIDMeta) error {
-	if err := c.store.PutMeta(ctx, MetaKeyClientID, meta); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	c.clientID = meta
-	c.mu.Unlock()
-	return nil
+	return c.withWriteGate(ctx, func() error {
+		if err := c.store.PutMeta(ctx, MetaKeyClientID, meta); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		c.clientID = meta
+		c.mu.Unlock()
+		return nil
+	})
 }
 
 // FullScan returns the cached FullScanMeta.
@@ -483,50 +521,56 @@ func (c *Cache) FullScan() FullScanMeta {
 
 // PutFullScan persists FullScanMeta and updates the cache.
 func (c *Cache) PutFullScan(ctx context.Context, meta FullScanMeta) error {
-	if err := c.store.PutMeta(ctx, MetaKeyFullScan, meta); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	c.fullScan = meta
-	c.mu.Unlock()
-	return nil
+	return c.withWriteGate(ctx, func() error {
+		if err := c.store.PutMeta(ctx, MetaKeyFullScan, meta); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		c.fullScan = meta
+		c.mu.Unlock()
+		return nil
+	})
 }
 
 // ResetSyncScope clears files, folders, syncRoot, changeToken, and fullScan
 // in Store and Cache while preserving clientId and engineState.
 func (c *Cache) ResetSyncScope(ctx context.Context) error {
-	if err := c.store.ResetSyncScope(ctx); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	c.filesByPath = make(map[string]FileRecord)
-	c.driveIDToPath = make(map[string]string)
-	c.foldersByID = make(map[string]FolderRecord)
-	c.foldersByPath = make(map[string][]FolderRecord)
-	c.conflictPaths = make(map[string]string)
-	c.syncRoot = SyncRootMeta{}
-	c.changeToken = ChangeTokenMeta{}
-	c.fullScan = FullScanMeta{}
-	c.mu.Unlock()
-	return nil
+	return c.withWriteGate(ctx, func() error {
+		if err := c.store.ResetSyncScope(ctx); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		c.filesByPath = make(map[string]FileRecord)
+		c.driveIDToPath = make(map[string]string)
+		c.foldersByID = make(map[string]FolderRecord)
+		c.foldersByPath = make(map[string][]FolderRecord)
+		c.conflictPaths = make(map[string]string)
+		c.syncRoot = SyncRootMeta{}
+		c.changeToken = ChangeTokenMeta{}
+		c.fullScan = FullScanMeta{}
+		c.mu.Unlock()
+		return nil
+	})
 }
 
 // ClearAll clears all 3 stores and resets all in-memory maps and metadata.
 func (c *Cache) ClearAll(ctx context.Context) error {
-	if err := c.store.ClearAll(ctx); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	c.filesByPath = make(map[string]FileRecord)
-	c.driveIDToPath = make(map[string]string)
-	c.foldersByID = make(map[string]FolderRecord)
-	c.foldersByPath = make(map[string][]FolderRecord)
-	c.conflictPaths = make(map[string]string)
-	c.syncRoot = SyncRootMeta{}
-	c.changeToken = ChangeTokenMeta{}
-	c.engineState = EngineStateMeta{}
-	c.clientID = ClientIDMeta{}
-	c.fullScan = FullScanMeta{}
-	c.mu.Unlock()
-	return nil
+	return c.withWriteGate(ctx, func() error {
+		if err := c.store.ClearAll(ctx); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		c.filesByPath = make(map[string]FileRecord)
+		c.driveIDToPath = make(map[string]string)
+		c.foldersByID = make(map[string]FolderRecord)
+		c.foldersByPath = make(map[string][]FolderRecord)
+		c.conflictPaths = make(map[string]string)
+		c.syncRoot = SyncRootMeta{}
+		c.changeToken = ChangeTokenMeta{}
+		c.engineState = EngineStateMeta{}
+		c.clientID = ClientIDMeta{}
+		c.fullScan = FullScanMeta{}
+		c.mu.Unlock()
+		return nil
+	})
 }

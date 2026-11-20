@@ -195,3 +195,26 @@ func TestResumableUploadAndChangesPaging(t *testing.T) {
 		t.Fatalf("unexpected changes: %+v", changes)
 	}
 }
+
+func TestLockCreateContextCancelAndEviction(t *testing.T) {
+	client := NewClient(nil, nil, DefaultRetryOptions())
+
+	unlock, err := client.lockCreate(context.Background(), "parent-1", "note.md")
+	if err != nil {
+		t.Fatalf("initial lockCreate: %v", err)
+	}
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := client.lockCreate(cancelCtx, "parent-1", "note.md"); err == nil {
+		t.Fatalf("expected canceled context to abort waiting lockCreate")
+	}
+
+	unlock()
+	client.createMu.Lock()
+	remaining := len(client.createLocks)
+	client.createMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("expected createLocks entry evicted after unlock, got len=%d", remaining)
+	}
+}

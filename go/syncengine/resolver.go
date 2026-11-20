@@ -16,6 +16,15 @@ import (
 	"vaultshare/go/syncstate"
 )
 
+var errLocalChangedDuringPull = errors.New("syncengine: local file changed during Drive download")
+
+type pullOptions struct {
+	isNew          bool
+	forceOverwrite bool
+	expectLocalSHA string
+	expectLocalMD5 string
+}
+
 func (e *Engine) resolvePath(ctx context.Context, relPath string) error {
 	// TODO(slow-binary-create): Open Question #1 — add size/mtime stability probe
 	// before uploading newly created non-text files.
@@ -23,6 +32,12 @@ func (e *Engine) resolvePath(ctx context.Context, relPath string) error {
 	if isExcludedPath(relPath, e.vault.ConfigDir()) {
 		return nil
 	}
+	return e.withPathLock(ctx, relPath, func() error {
+		return e.resolvePathLocked(ctx, relPath)
+	})
+}
+
+func (e *Engine) resolvePathLocked(ctx context.Context, relPath string) error {
 
 	rootID := e.cache.SyncRoot().RootFolderID
 	if rootID == "" {
@@ -74,6 +89,16 @@ func (e *Engine) resolvePath(ctx context.Context, relPath string) error {
 			rec.Conflict == nil {
 			return nil
 		}
+	}
+
+	// Sole authority for state-discrepancy logging (evaluated exclusively under pathLock
+	// with freshly fetched Vault, Drive, and Sync State DB metadata).
+	if len(driveFiles) > 1 {
+		e.log(settings.LogWarning, "Duplicate Drive files at path", relPath)
+	}
+	if localFound && rec.LastSynced != nil && localStat.MTimeMs < rec.LastSynced.LocalMtimeMs {
+		e.log(settings.LogWarning, "Local file older than last synced state",
+			fmt.Sprintf("%s (disk=%d db=%d)", relPath, localStat.MTimeMs, rec.LastSynced.LocalMtimeMs))
 	}
 
 	var localData []byte
@@ -143,11 +168,11 @@ func (e *Engine) resolvePath(ctx context.Context, relPath string) error {
 			}
 		}
 		if localConfirmedTrash && !driveChanged {
+			e.recordDriveEcho(driveFiles[0].ID, "")
 			if err := e.drive.TrashFile(ctx, driveFiles[0].ID); err != nil {
 				e.handleIOError(err, "TrashFile "+relPath)
 				return err
 			}
-			e.recordDriveEcho(driveFiles[0].ID, "")
 			_ = e.cache.DeleteFile(ctx, relPath)
 			e.metrics.IncResolution(func(c *settings.ResolutionCounters) { c.Trashed++ })
 			e.log(settings.LogInfo, "Mirrored local trash to Drive", relPath)
@@ -170,9 +195,20 @@ func (e *Engine) resolvePath(ctx context.Context, relPath string) error {
 		driveChanged := !driveMatchesBaseline(driveFiles[0], rec.LastSynced)
 		switch {
 		case localChanged && !driveChanged:
-			return e.pushExistingLocalFile(ctx, relPath, driveFiles[0].ID, localStat, localData, localSHA, localMD5)
+			return e.pushExistingLocalFile(ctx, relPath, driveFiles[0].ID, driveFiles[0].HeadRevisionID, localStat, localData, localSHA, localMD5)
 		case !localChanged && driveChanged:
-			return e.pullExistingDriveFile(ctx, relPath, driveFiles[0])
+			err := e.pullDriveFile(ctx, relPath, driveFiles[0], pullOptions{
+				isNew:          false,
+				forceOverwrite: false,
+				expectLocalSHA: localSHA,
+				expectLocalMD5: localMD5,
+			})
+			if errors.Is(err, errLocalChangedDuringPull) {
+				e.log(settings.LogInfo, "Local file changed during Drive download; retrying merge", relPath)
+				e.queue.Enqueue(relPath, PriorityHigh, "pull-retry", e.now(), 0)
+				return nil
+			}
+			return err
 		}
 	}
 
@@ -269,12 +305,26 @@ func (e *Engine) pushNewLocalFile(
 
 func (e *Engine) pushExistingLocalFile(
 	ctx context.Context,
-	relPath, driveFileID string,
+	relPath, driveFileID, expectedHeadRev string,
 	st LocalStat,
 	data []byte,
 	shaHex, md5Hex string,
 ) error {
+	if expectedHeadRev != "" {
+		meta, found, metaErr := e.drive.GetFileMeta(ctx, driveFileID)
+		if metaErr != nil {
+			e.handleIOError(metaErr, "GetFileMeta pre-upload "+relPath)
+			return metaErr
+		}
+		if !found || meta.Trashed || (meta.HeadRevisionID != "" && meta.HeadRevisionID != expectedHeadRev) {
+			e.log(settings.LogInfo, "Drive file changed before upload; retrying sync", relPath)
+			e.queue.Enqueue(relPath, PriorityHigh, "push-retry", e.now(), 0)
+			return nil
+		}
+	}
+
 	mimeType := gdrive.ContentMimeType(relPath)
+	e.recordDriveEcho(driveFileID, md5Hex)
 	updated, err := e.drive.UpdateFile(ctx, driveFileID, mimeType, st.MTimeMs, data)
 	if err != nil {
 		e.handleIOError(err, "UpdateFile "+relPath)
@@ -287,14 +337,20 @@ func (e *Engine) pushExistingLocalFile(
 }
 
 func (e *Engine) pullNewDriveFile(ctx context.Context, relPath string, df gdrive.DriveFile) error {
-	return e.pullDriveFile(ctx, relPath, df, true)
+	err := e.pullDriveFile(ctx, relPath, df, pullOptions{isNew: true})
+	if errors.Is(err, errLocalChangedDuringPull) {
+		e.log(settings.LogInfo, "Local file appeared during Drive download; retrying sync", relPath)
+		e.queue.Enqueue(relPath, PriorityHigh, "pull-retry", e.now(), 0)
+		return nil
+	}
+	return err
 }
 
 func (e *Engine) pullExistingDriveFile(ctx context.Context, relPath string, df gdrive.DriveFile) error {
-	return e.pullDriveFile(ctx, relPath, df, false)
+	return e.pullDriveFile(ctx, relPath, df, pullOptions{isNew: false, forceOverwrite: true})
 }
 
-func (e *Engine) pullDriveFile(ctx context.Context, relPath string, df gdrive.DriveFile, isNew bool) error {
+func (e *Engine) pullDriveFile(ctx context.Context, relPath string, df gdrive.DriveFile, opts pullOptions) error {
 	// Download Drive bytes BEFORE acquiring open-file lock.
 	data, err := e.drive.DownloadFile(ctx, df.ID)
 	if err != nil {
@@ -305,16 +361,37 @@ func (e *Engine) pullDriveFile(ctx context.Context, relPath string, df gdrive.Dr
 
 	var newStat LocalStat
 	err = e.vault.WithOpenFileLock(ctx, relPath, func(lockCtx context.Context) error {
+		// Re-verify local file state AFTER flushing the open editor buffer so
+		// keystrokes typed during DownloadFile are never silently overwritten.
+		if !opts.forceOverwrite {
+			curBytes, _, readErr := e.vault.ReadBytes(lockCtx, relPath)
+			if opts.isNew {
+				if readErr == nil {
+					return errLocalChangedDuringPull
+				}
+			} else if readErr == nil {
+				curSHA, curMD5 := computeHashes(curBytes)
+				if !hashesMatch(curSHA, curMD5, opts.expectLocalSHA, opts.expectLocalMD5) {
+					return errLocalChangedDuringPull
+				}
+			}
+		}
+
+		endEcho := e.beginLocalWrite(relPath)
 		var writeErr error
 		newStat, writeErr = e.writeLocalContent(lockCtx, relPath, data)
-		return writeErr
+		if writeErr != nil {
+			endEcho(false, "", 0)
+			return writeErr
+		}
+		endEcho(true, md5Hex, newStat.MTimeMs)
+		return nil
 	})
 	if err != nil {
 		return err
 	}
-	e.recordLocalEcho(relPath, md5Hex, newStat.MTimeMs)
 	e.metrics.IncResolution(func(c *settings.ResolutionCounters) { c.Pulled++ })
-	if isNew {
+	if opts.isNew {
 		e.log(settings.LogInfo, "Pulled new file from Drive", relPath)
 	} else {
 		e.log(settings.LogInfo, "Pulled remote update from Drive", relPath)
@@ -447,9 +524,15 @@ func (e *Engine) tryMergeConflict(
 		mergedBytes = []byte(mergedRes.Content)
 		mergedSHA, mergedMD5 = computeHashes(mergedBytes)
 		if !hasLocal || curLocal != mergedRes.Content {
+			endEcho := e.beginLocalWrite(relPath)
 			var writeErr error
 			postWriteStat, writeErr = e.vault.WriteText(lockCtx, relPath, mergedRes.Content)
-			return writeErr
+			if writeErr != nil {
+				endEcho(false, "", 0)
+				return writeErr
+			}
+			endEcho(true, mergedMD5, postWriteStat.MTimeMs)
+			return nil
 		}
 		postWriteStat = localStat
 		return nil
@@ -460,8 +543,6 @@ func (e *Engine) tryMergeConflict(
 	if mergedRes.Kind == "keepBoth" {
 		return false, nil
 	}
-
-	e.recordLocalEcho(relPath, mergedMD5, postWriteStat.MTimeMs)
 
 	// Re-check primary Drive headRevisionId right before UpdateFile to avoid silent overwrite.
 	primary := pickPrimaryDriveFile(driveFiles)
@@ -476,6 +557,7 @@ func (e *Engine) tryMergeConflict(
 		return true, nil
 	}
 
+	e.recordDriveEcho(primary.ID, mergedMD5)
 	updatedDrive, err := e.drive.UpdateFile(ctx, primary.ID, gdrive.ContentMimeType(relPath), postWriteStat.MTimeMs, mergedBytes)
 	if err != nil {
 		e.handleIOError(err, "UpdateFile post-merge "+relPath)
@@ -486,8 +568,8 @@ func (e *Engine) tryMergeConflict(
 	// Trash any extra Drive duplicates folded into the merged result.
 	for _, df := range driveFiles {
 		if df.ID != primary.ID {
-			_ = e.drive.TrashFile(ctx, df.ID)
 			e.recordDriveEcho(df.ID, "")
+			_ = e.drive.TrashFile(ctx, df.ID)
 		}
 	}
 
@@ -536,13 +618,13 @@ func (e *Engine) resolveByTimestamp(
 
 	if localWins {
 		primary := pickPrimaryDriveFile(driveFiles)
-		if err := e.pushExistingLocalFile(ctx, relPath, primary.ID, localStat, localData, localSHA, localMD5); err != nil {
+		if err := e.pushExistingLocalFile(ctx, relPath, primary.ID, primary.HeadRevisionID, localStat, localData, localSHA, localMD5); err != nil {
 			return err
 		}
 		for _, df := range driveFiles {
 			if df.ID != primary.ID {
-				_ = e.drive.TrashFile(ctx, df.ID)
 				e.recordDriveEcho(df.ID, "")
+				_ = e.drive.TrashFile(ctx, df.ID)
 			}
 		}
 	} else {
@@ -551,8 +633,8 @@ func (e *Engine) resolveByTimestamp(
 		}
 		for _, df := range driveFiles {
 			if df.ID != bestDrive.ID {
-				_ = e.drive.TrashFile(ctx, df.ID)
 				e.recordDriveEcho(df.ID, "")
+				_ = e.drive.TrashFile(ctx, df.ID)
 			}
 		}
 	}
@@ -581,13 +663,13 @@ func (e *Engine) resolveKeepLocal(
 		}
 	} else {
 		primary := pickPrimaryDriveFile(driveFiles)
-		if err := e.pushExistingLocalFile(ctx, relPath, primary.ID, localStat, localData, localSHA, localMD5); err != nil {
+		if err := e.pushExistingLocalFile(ctx, relPath, primary.ID, primary.HeadRevisionID, localStat, localData, localSHA, localMD5); err != nil {
 			return err
 		}
 		for _, df := range driveFiles {
 			if df.ID != primary.ID {
-				_ = e.drive.TrashFile(ctx, df.ID)
 				e.recordDriveEcho(df.ID, "")
+				_ = e.drive.TrashFile(ctx, df.ID)
 			}
 		}
 	}

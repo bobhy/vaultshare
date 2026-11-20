@@ -59,7 +59,10 @@ func (c *Client) CreateFile(
 		mimeType = ContentMimeType(name)
 	}
 
-	unlock := c.lockCreate(parentID, name)
+	unlock, err := c.lockCreate(ctx, parentID, name)
+	if err != nil {
+		return DriveFile{}, err
+	}
 	defer unlock()
 
 	existing, err := c.findChildren(ctx, parentID, name, false)

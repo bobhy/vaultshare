@@ -25,6 +25,12 @@ const (
 	loginNoticeMessage    = "VaultShare Google Drive authorization expired or is missing. Sign in again in Settings."
 )
 
+type vaultEventReq struct {
+	ctx  context.Context
+	ev   settings.VaultEventPayload
+	done chan error
+}
+
 // EngineDeps bundles external ports and clocks required to construct an Engine.
 type EngineDeps struct {
 	Vault       VaultPort
@@ -48,27 +54,32 @@ type Engine struct {
 	transport *gdrive.Transport
 	sink      EventSink
 	queue     *workQueue
+	pathLocks *pathLocker
 	logs      *logRing
 	metrics   *metricsTracker
 	now       func() time.Time
 
 	workerCount int
 
-	stateMu        sync.RWMutex
-	cfg            settings.PluginSettings
-	vaultName      string
-	paused         bool
-	needsLogin     bool
-	loginNotified  bool
-	offline        bool
-	lastEmittedEv  settings.GlobalStatusEvent
-	hasEmittedEv   bool
+	stateMu       sync.RWMutex
+	cfg           settings.PluginSettings
+	vaultName     string
+	paused        bool
+	needsLogin    bool
+	loginNotified bool
+	offline       bool
+	lastEmittedEv settings.GlobalStatusEvent
+	hasEmittedEv  bool
 
-	echoMu            sync.Mutex
-	recentLocalWrites map[string]echoEntry
-	recentDriveWrites map[string]echoEntry
-	inSessionDeletes  map[string]time.Time
-	warnedNativeDocs  map[string]bool
+	echoMu              sync.Mutex
+	inFlightLocalWrites map[string]int
+	recentLocalWrites   map[string]echoEntry
+	recentDriveWrites   map[string]echoEntry
+	inSessionDeletes    map[string]time.Time
+	warnedNativeDocs    map[string]bool
+
+	eventIngestMu sync.Mutex
+	eventCh       chan vaultEventReq
 
 	debounceMu sync.Mutex
 	debounces  map[string]*debounceEntry
@@ -84,11 +95,14 @@ type Engine struct {
 	fullScanMu      sync.Mutex
 	fullScanRunning bool
 
-	pollWakeCh chan struct{}
+	pollWakeCh    chan struct{}
+	scanTriggerCh chan struct{}
 
-	loopMu     sync.Mutex
-	loopCancel context.CancelFunc
-	loopWG     sync.WaitGroup
+	epochMu     sync.Mutex
+	runLoops    bool
+	stopped     bool
+	epochCancel context.CancelFunc
+	epochWG     sync.WaitGroup
 }
 
 // NewEngine creates an Engine ready for Start.
@@ -103,27 +117,31 @@ func NewEngine(deps EngineDeps) *Engine {
 	}
 	defCfg := settings.DefaultSettings()
 	return &Engine{
-		vault:             deps.Vault,
-		drive:             deps.Drive,
-		auth:              deps.Auth,
-		store:             deps.Store,
-		cache:             syncstate.NewCache(deps.Store),
-		transport:         deps.Transport,
-		sink:              deps.Sink,
-		queue:             newWorkQueue(),
-		logs:              newLogRing(defCfg.LogMinSeverity, defCfg.LogHorizon, deps.Sink),
-		metrics:           &metricsTracker{},
-		now:               nowFn,
-		workerCount:       workers,
-		cfg:               defCfg,
-		recentLocalWrites: make(map[string]echoEntry),
-		recentDriveWrites: make(map[string]echoEntry),
-		inSessionDeletes:  make(map[string]time.Time),
-		warnedNativeDocs:  make(map[string]bool),
-		debounces:         make(map[string]*debounceEntry),
-		pendingDeletes:    make(map[string]*pendingDeleteEntry),
-		pendingCreates:    make(map[string]*pendingCreateEntry),
-		pollWakeCh:        make(chan struct{}, 1),
+		vault:               deps.Vault,
+		drive:               deps.Drive,
+		auth:                deps.Auth,
+		store:               deps.Store,
+		cache:               syncstate.NewCache(deps.Store),
+		transport:           deps.Transport,
+		sink:                deps.Sink,
+		queue:               newWorkQueue(),
+		pathLocks:           newPathLocker(),
+		logs:                newLogRing(defCfg.LogMinSeverity, defCfg.LogHorizon, deps.Sink),
+		metrics:             &metricsTracker{},
+		now:                 nowFn,
+		workerCount:         workers,
+		cfg:                 defCfg,
+		inFlightLocalWrites: make(map[string]int),
+		recentLocalWrites:   make(map[string]echoEntry),
+		recentDriveWrites:   make(map[string]echoEntry),
+		inSessionDeletes:    make(map[string]time.Time),
+		warnedNativeDocs:    make(map[string]bool),
+		eventCh:             make(chan vaultEventReq, 256),
+		debounces:           make(map[string]*debounceEntry),
+		pendingDeletes:      make(map[string]*pendingDeleteEntry),
+		pendingCreates:      make(map[string]*pendingCreateEntry),
+		pollWakeCh:          make(chan struct{}, 1),
+		scanTriggerCh:       make(chan struct{}, 1),
 	}
 }
 
@@ -198,50 +216,127 @@ func (e *Engine) Start(ctx context.Context, cfg settings.PluginSettings, vaultNa
 
 	e.emitGlobalStatusIfChanged()
 
+	e.epochMu.Lock()
+	e.runLoops = runLoops
+	e.stopped = false
 	if runLoops {
-		e.startBackgroundLoops(needInitialScan)
+		e.startEpochLoopsLocked(needInitialScan)
 	}
+	e.epochMu.Unlock()
 	return nil
 }
 
-// Stop cancels background loops, stops pending timers, and waits for workers to exit.
+// Stop cancels all background loops, stops pending timers, and waits for all
+// workers, coordinator, and event router goroutines to exit cleanly.
 func (e *Engine) Stop() {
-	e.loopMu.Lock()
-	cancel := e.loopCancel
-	e.loopCancel = nil
-	e.loopMu.Unlock()
+	e.epochMu.Lock()
+	e.stopped = true
+	e.stopEpochLoopsLocked()
+	e.epochMu.Unlock()
+}
 
+func (e *Engine) startEpochLoopsLocked(runInitialFullScan bool) {
+	if e.epochCancel != nil {
+		return
+	}
+	epochCtx, cancel := context.WithCancel(context.Background())
+	e.epochCancel = cancel
+
+	for i := 0; i < e.workerCount; i++ {
+		e.epochWG.Add(1)
+		go func() {
+			defer e.epochWG.Done()
+			e.workerLoop(epochCtx)
+		}()
+	}
+
+	e.epochWG.Add(1)
+	go func() {
+		defer e.epochWG.Done()
+		e.coordinatorLoop(epochCtx, runInitialFullScan)
+	}()
+
+	e.epochWG.Add(1)
+	go func() {
+		defer e.epochWG.Done()
+		e.eventRouterLoop(epochCtx)
+	}()
+}
+
+func (e *Engine) stopEpochLoopsLocked() {
+	cancel := e.epochCancel
+	e.epochCancel = nil
 	if cancel != nil {
 		cancel()
 	}
 	e.queue.Wake()
 	e.wakePoller()
 	e.cancelAllTimers()
-	e.loopWG.Wait()
+	e.epochWG.Wait()
 }
 
-func (e *Engine) startBackgroundLoops(runInitialFullScan bool) {
-	e.loopMu.Lock()
-	defer e.loopMu.Unlock()
-	if e.loopCancel != nil {
-		return
-	}
-	loopCtx, cancel := context.WithCancel(context.Background())
-	e.loopCancel = cancel
+// resetEpoch halts all active workers/coordinator/event router goroutines, clears
+// transient queues and timers, executes fn with zero concurrent DB writers, and
+// restarts a clean epoch when runLoops is active.
+func (e *Engine) resetEpoch(fn func() error, runInitialScan bool) error {
+	e.epochMu.Lock()
+	defer e.epochMu.Unlock()
 
-	for i := 0; i < e.workerCount; i++ {
-		e.loopWG.Add(1)
-		go func() {
-			defer e.loopWG.Done()
-			e.workerLoop(loopCtx)
-		}()
+	e.stopEpochLoopsLocked()
+	e.queue.Clear()
+	e.clearTransientState()
+
+	if err := fn(); err != nil {
+		if e.runLoops && !e.stopped {
+			e.startEpochLoopsLocked(false)
+		}
+		return err
 	}
 
-	e.loopWG.Add(1)
-	go func() {
-		defer e.loopWG.Done()
-		e.pollLoop(loopCtx, runInitialFullScan)
-	}()
+	if e.runLoops && !e.stopped {
+		e.startEpochLoopsLocked(runInitialScan)
+	}
+	return nil
+}
+
+func (e *Engine) clearTransientState() {
+	e.echoMu.Lock()
+	e.inFlightLocalWrites = make(map[string]int)
+	e.recentLocalWrites = make(map[string]echoEntry)
+	e.recentDriveWrites = make(map[string]echoEntry)
+	e.inSessionDeletes = make(map[string]time.Time)
+	e.warnedNativeDocs = make(map[string]bool)
+	e.echoMu.Unlock()
+
+	e.batchMu.Lock()
+	e.activeBatch = nil
+	e.batchMu.Unlock()
+
+	// Drain any stale queued Vault events from the previous epoch.
+	for {
+		select {
+		case req := <-e.eventCh:
+			if req.done != nil {
+				req.done <- nil
+			}
+		default:
+			return
+		}
+	}
+}
+
+func (e *Engine) eventRouterLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case req := <-e.eventCh:
+			err := e.processVaultEventOrdered(ctx, req.ev)
+			if req.done != nil {
+				req.done <- err
+			}
+		}
+	}
 }
 
 func (e *Engine) workerLoop(ctx context.Context) {
@@ -260,9 +355,9 @@ func (e *Engine) workerLoop(ctx context.Context) {
 			}
 		}
 
-		err := e.resolvePath(ctx, task.Path)
+		err := e.executeTask(ctx, task)
 		e.completeBatchTask(ctx, task.Path, task.BatchIDs, err)
-		e.queue.Finish(task.Path)
+		e.queue.FinishTask(task)
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
 				e.log(settings.LogError, "Sync task failed: "+task.Path, err.Error())
@@ -274,7 +369,23 @@ func (e *Engine) workerLoop(ctx context.Context) {
 	}
 }
 
-func (e *Engine) pollLoop(ctx context.Context, runInitialFullScan bool) {
+func (e *Engine) executeTask(ctx context.Context, task *SyncTask) error {
+	switch task.Kind {
+	case TaskLocalRename:
+		return e.handleLocalFileRename(ctx, task.OldPath, task.Path)
+	case TaskLocalFolderRename:
+		return e.handleLocalFolderRename(ctx, task.OldPath, task.Path)
+	case TaskTrashEmptyFolder:
+		e.trashDriveFolderIfEmpty(ctx, task.Path)
+		return nil
+	default:
+		return e.resolvePath(ctx, task.Path)
+	}
+}
+
+// coordinatorLoop is the sole owner of Drive changes.list polling and Full Scan
+// execution, ensuring they never run concurrently or race on FolderRecords.
+func (e *Engine) coordinatorLoop(ctx context.Context, runInitialFullScan bool) {
 	if runInitialFullScan && !e.IsPaused() && !e.NeedsLogin() {
 		_ = e.runFullScan(ctx)
 	}
@@ -299,6 +410,11 @@ func (e *Engine) pollLoop(ctx context.Context, runInitialFullScan bool) {
 		case <-heartbeat.C:
 			timer.Stop()
 			e.emitGlobalStatusIfChanged()
+		case <-e.scanTriggerCh:
+			timer.Stop()
+			if !e.IsPaused() && !e.NeedsLogin() {
+				_ = e.runFullScan(ctx)
+			}
 		case <-e.pollWakeCh:
 			timer.Stop()
 			e.runPollCycle(ctx)
@@ -330,7 +446,17 @@ func (e *Engine) wakePoller() {
 	}
 }
 
-// UpdateSettings applies normalized settings dynamically and handles syncRootFolder changes.
+// RequestFullScan schedules a Full Scan on the coordinatorLoop (never spawning an
+// untracked goroutine or running concurrently with pollDriveChangesOnce).
+func (e *Engine) RequestFullScan() {
+	select {
+	case e.scanTriggerCh <- struct{}{}:
+	default:
+	}
+}
+
+// UpdateSettings applies normalized settings dynamically and handles syncRootFolder
+// changes with a clean epoch barrier so no old-scope worker can write stale state.
 func (e *Engine) UpdateSettings(ctx context.Context, cfg settings.PluginSettings) error {
 	cfg = settings.NormalizeSettings(cfg)
 
@@ -348,19 +474,25 @@ func (e *Engine) UpdateSettings(ctx context.Context, cfg settings.PluginSettings
 
 	if prevRoot != nextRoot && nextRoot != e.cache.SyncRoot().RootFolderName {
 		e.log(settings.LogInfo, "Sync root folder updated; resetting sync baseline", fmt.Sprintf("%s -> %s", prevRoot, nextRoot))
-		if err := e.cache.ResetSyncScope(ctx); err != nil {
-			return err
-		}
-		if !e.NeedsLogin() {
-			if _, err := e.ensureSyncRootID(ctx); err != nil {
-				e.handleIOError(err, "EnsureSyncRoot")
-			} else if tok, err := e.drive.GetStartPageToken(ctx); err == nil && tok != "" {
-				_ = e.cache.PutChangeToken(ctx, syncstate.ChangeTokenMeta{
-					StartPageToken: tok,
-					UpdatedAtMs:    e.now().UnixMilli(),
-				})
+		err := e.resetEpoch(func() error {
+			if err := e.cache.ResetSyncScope(ctx); err != nil {
+				return err
 			}
-			_ = e.StartupLocalDiff(ctx)
+			if !e.NeedsLogin() {
+				if _, err := e.ensureSyncRootID(ctx); err != nil {
+					e.handleIOError(err, "EnsureSyncRoot")
+				} else if tok, err := e.drive.GetStartPageToken(ctx); err == nil && tok != "" {
+					_ = e.cache.PutChangeToken(ctx, syncstate.ChangeTokenMeta{
+						StartPageToken: tok,
+						UpdatedAtMs:    e.now().UnixMilli(),
+					})
+				}
+				_ = e.StartupLocalDiff(ctx)
+			}
+			return nil
+		}, !e.NeedsLogin())
+		if err != nil {
+			return err
 		}
 	}
 
@@ -444,15 +576,24 @@ func (e *Engine) Resume(ctx context.Context) error {
 	return nil
 }
 
-// TriggerFullScan initiates an immediate Full Scan pass.
+// TriggerFullScan initiates a Full Scan synchronously (when background loops are
+// off, e.g. in tests) or signals coordinatorLoop when running live.
 func (e *Engine) TriggerFullScan(ctx context.Context) error {
+	e.epochMu.Lock()
+	loopsActive := e.epochCancel != nil
+	e.epochMu.Unlock()
+	if loopsActive {
+		e.RequestFullScan()
+		return nil
+	}
 	return e.runFullScan(ctx)
 }
 
-// FlushHighPriority flushes pending local debounces and waits up to ctx deadline
-// for all High-priority tasks to drain before Obsidian sleeps or suspends.
+// FlushHighPriority flushes pending local debounces and held deletes, then waits
+// up to ctx deadline for all High-priority tasks to drain before sleep/suspend.
 func (e *Engine) FlushHighPriority(ctx context.Context) (bool, error) {
 	e.FlushDebounces()
+	e.FlushPendingDeletes()
 	if e.IsPaused() || e.NeedsLogin() {
 		return false, nil
 	}
@@ -609,6 +750,12 @@ func (e *Engine) ResolveVersionConflict(ctx context.Context, req settings.Resolv
 	if relPath == "" {
 		return errors.New("path is required")
 	}
+	return e.withPathLock(ctx, relPath, func() error {
+		return e.resolveVersionConflictLocked(ctx, relPath, req)
+	})
+}
+
+func (e *Engine) resolveVersionConflictLocked(ctx context.Context, relPath string, req settings.ResolveVersionConflictRequest) error {
 	rec, hasRec := e.cache.GetFile(relPath)
 
 	switch req.Winner {
@@ -636,7 +783,7 @@ func (e *Engine) ResolveVersionConflict(ctx context.Context, req settings.Resolv
 			}
 		}
 		if targetID != "" {
-			if err := e.pushExistingLocalFile(ctx, relPath, targetID, st, data, shaHex, md5Hex); err != nil {
+			if err := e.pushExistingLocalFile(ctx, relPath, targetID, "", st, data, shaHex, md5Hex); err != nil {
 				return err
 			}
 			e.trashExtraDriveIDs(ctx, rec, targetID)
@@ -670,7 +817,10 @@ func (e *Engine) ResolveVersionConflict(ctx context.Context, req settings.Resolv
 			}
 			e.metrics.IncResolution(func(c *settings.ResolutionCounters) { c.Trashed++ })
 		} else {
-			if err := e.pullDriveFile(ctx, relPath, meta, !hasRec || rec.LastSynced == nil); err != nil {
+			if err := e.pullDriveFile(ctx, relPath, meta, pullOptions{
+				isNew:          !hasRec || rec.LastSynced == nil,
+				forceOverwrite: true,
+			}); err != nil {
 				return err
 			}
 			e.trashExtraDriveIDs(ctx, rec, meta.ID)
@@ -699,48 +849,65 @@ func (e *Engine) ResolveVersionConflict(ctx context.Context, req settings.Resolv
 // note, clears its ConflictMarkers flag, and enqueues the note at PriorityHigh.
 func (e *Engine) ClearMarkerConflict(ctx context.Context, rawPath string) error {
 	relPath := normalizeRelPath(rawPath)
-	data, _, err := e.vault.ReadBytes(ctx, relPath)
+	if relPath == "" {
+		return errors.New("path is required")
+	}
+	return e.withPathLock(ctx, relPath, func() error {
+		data, _, err := e.vault.ReadBytes(ctx, relPath)
+		if err != nil {
+			return err
+		}
+		if merge.HasConflictMarkersWith(string(data), merge.StyleForPath(relPath)) {
+			return errors.New("conflict markers are still present in " + relPath)
+		}
+		rec, ok := e.cache.GetFile(relPath)
+		if !ok {
+			return errors.New("no sync record for " + relPath)
+		}
+		rec.Conflict = nil
+		rec.UpdatedAtMs = e.now().UnixMilli()
+		if err := e.cache.PutFile(ctx, rec); err != nil {
+			return err
+		}
+		e.queue.Enqueue(relPath, PriorityHigh, "manual-clear", e.now(), 0)
+		e.log(settings.LogInfo, "Cleared marker conflict", relPath)
+		e.emitGlobalStatusIfChanged()
+		return nil
+	})
+}
+
+func (e *Engine) isPathBusy(path string) bool {
+	return e.queue.IsInFlight(path) || e.pathLocks.IsBusy(path)
+}
+
+func (e *Engine) withPathLock(ctx context.Context, path string, fn func() error) error {
+	return e.withPathLocks(ctx, []string{path}, fn)
+}
+
+func (e *Engine) withPathLocks(ctx context.Context, paths []string, fn func() error) error {
+	release, err := e.pathLocks.Acquire(ctx, paths...)
 	if err != nil {
 		return err
 	}
-	if merge.HasConflictMarkersWith(string(data), merge.StyleForPath(relPath)) {
-		return errors.New("conflict markers are still present in " + relPath)
-	}
-	rec, ok := e.cache.GetFile(relPath)
-	if !ok {
-		return errors.New("no sync record for " + relPath)
-	}
-	rec.Conflict = nil
-	rec.UpdatedAtMs = e.now().UnixMilli()
-	if err := e.cache.PutFile(ctx, rec); err != nil {
-		return err
-	}
-	e.queue.Enqueue(relPath, PriorityHigh, "manual-clear", e.now(), 0)
-	e.log(settings.LogInfo, "Cleared marker conflict", relPath)
-	e.emitGlobalStatusIfChanged()
-	return nil
+	defer release()
+	return fn()
 }
 
-// ClearAllState wipes the Sync State DB and transient timers while keeping auth intact.
+// ClearAllState halts active background work, clears queues/timers and the Sync
+// State DB under an epoch barrier, and restarts cleanly while keeping auth intact.
 func (e *Engine) ClearAllState(ctx context.Context) error {
-	e.cancelAllTimers()
-	e.echoMu.Lock()
-	e.recentLocalWrites = make(map[string]echoEntry)
-	e.recentDriveWrites = make(map[string]echoEntry)
-	e.inSessionDeletes = make(map[string]time.Time)
-	e.warnedNativeDocs = make(map[string]bool)
-	e.echoMu.Unlock()
-
-	e.batchMu.Lock()
-	e.activeBatch = nil
-	e.batchMu.Unlock()
-
-	if err := e.cache.ClearAll(ctx); err != nil {
+	err := e.resetEpoch(func() error {
+		if err := e.cache.ClearAll(ctx); err != nil {
+			return err
+		}
+		e.stateMu.Lock()
+		e.paused = false
+		e.stateMu.Unlock()
+		return nil
+	}, false)
+	if err != nil {
 		return err
 	}
-	e.stateMu.Lock()
-	e.paused = false
-	e.stateMu.Unlock()
 
 	e.log(settings.LogInfo, "Cleared all local sync state", "")
 	e.emitGlobalStatusIfChanged()
@@ -824,8 +991,8 @@ func (e *Engine) trashExtraDriveIDs(ctx context.Context, rec syncstate.FileRecor
 		if id == "" || id == keepID {
 			continue
 		}
-		_ = e.drive.TrashFile(ctx, id)
 		e.recordDriveEcho(id, "")
+		_ = e.drive.TrashFile(ctx, id)
 	}
 }
 

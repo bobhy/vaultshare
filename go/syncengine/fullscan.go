@@ -16,9 +16,13 @@ type scanFolderItem struct {
 	relDir   string
 }
 
-// runFullScan walks the entire Drive sync root and local vault snapshot in
-// randomized folder/file order, refreshes the FolderRecord cache, logs state
-// anomalies, and enqueues any diverged paths at PriorityBulk.
+// runFullScan walks the entire Drive sync root and local vault paths in randomized
+// order inside coordinatorLoop (serialized with pollDriveChangesOnce), refreshes
+// FolderRecords, and enqueues diverged or unknown paths at PriorityBulk.
+//
+// Full Scan is strictly a discovery pass: it never emits unlocked per-file state
+// discrepancy warnings; resolvePath (holding the exclusive per-path lock with
+// fresh Vault, Drive, and Cache state) is the sole authority for file judgments.
 func (e *Engine) runFullScan(ctx context.Context) error {
 	if e.IsPaused() || e.NeedsLogin() {
 		return nil
@@ -58,7 +62,9 @@ func (e *Engine) runFullScan(ctx context.Context) error {
 		return err
 	}
 	cfgDir := e.vault.ConfigDir()
-	localByPath := make(map[string]LocalStat, len(stats))
+	// Track only path presence so local-only files absent on Drive are discovered
+	// without keeping a stale Go-side copy of LocalStat metadata.
+	localPaths := make(map[string]bool, len(stats))
 	for _, st := range stats {
 		if st.IsFolder {
 			continue
@@ -67,19 +73,14 @@ func (e *Engine) runFullScan(ctx context.Context) error {
 		if p == "" || isExcludedPath(p, cfgDir) {
 			continue
 		}
-		localByPath[p] = LocalStat{
-			Path:     p,
-			Size:     st.Size,
-			MTimeMs:  st.MTimeMs,
-			IsFolder: false,
-		}
+		localPaths[p] = true
 	}
 
-	totalEstimate := len(localByPath)
+	totalEstimate := len(localPaths)
 	scanned := 0
 	e.metrics.UpdateFullScan(scanned, totalEstimate, e.now())
 
-	seenDrivePaths := make(map[string]bool, len(localByPath))
+	seenDrivePaths := make(map[string]bool, len(localPaths))
 	stack := []scanFolderItem{{folderID: rootID, relDir: ""}}
 	visitedFolders := make(map[string]bool)
 
@@ -109,13 +110,13 @@ func (e *Engine) runFullScan(ctx context.Context) error {
 			return err
 		}
 
-		e.processScanFiles(cur, childFiles, cfgDir, localByPath, seenDrivePaths, &scanned, &totalEstimate)
+		e.processScanFiles(ctx, cur, childFiles, cfgDir, localPaths, seenDrivePaths, &scanned, &totalEstimate)
 		e.metrics.UpdateFullScan(scanned, totalEstimate, e.now())
 	}
 
-	// Compare local-only files (absent on Drive) and orphan DB records.
+	// Enqueue local-only files absent on Drive and orphan DB records.
 	localOnly := make([]string, 0)
-	for relPath := range localByPath {
+	for relPath := range localPaths {
 		if !seenDrivePaths[relPath] {
 			localOnly = append(localOnly, relPath)
 		}
@@ -132,22 +133,19 @@ func (e *Engine) runFullScan(ctx context.Context) error {
 			return nil
 		}
 		scanned++
-		st := localByPath[relPath]
-		rec, hasRec := e.cache.GetFile(relPath)
-		if hasRec && rec.LastSynced != nil && st.MTimeMs < rec.LastSynced.LocalMtimeMs {
-			e.log(settings.LogWarning, "Local file older than last synced state", relPath)
-		} else {
-			e.log(settings.LogInfo, "Local file absent on Drive", relPath)
+		if e.isPathBusy(relPath) {
+			continue
+		}
+		if _, liveFound, statErr := e.vault.Stat(ctx, relPath); statErr != nil || !liveFound {
+			continue
 		}
 		e.queue.Enqueue(relPath, PriorityBulk, "fullscan", e.now(), 0)
 		e.metrics.UpdateFullScan(scanned, max(totalEstimate, scanned), e.now())
 	}
 
 	for _, rec := range e.cache.ListFiles() {
-		if !seenDrivePaths[rec.Path] {
-			if _, ok := localByPath[rec.Path]; !ok {
-				e.queue.Enqueue(rec.Path, PriorityBulk, "fullscan", e.now(), 0)
-			}
+		if !seenDrivePaths[rec.Path] && !localPaths[rec.Path] && !e.isPathBusy(rec.Path) {
+			e.queue.Enqueue(rec.Path, PriorityBulk, "fullscan", e.now(), 0)
 		}
 	}
 
@@ -222,10 +220,11 @@ func (e *Engine) processScanFolders(
 }
 
 func (e *Engine) processScanFiles(
+	ctx context.Context,
 	cur scanFolderItem,
 	childFiles []gdrive.DriveFile,
 	cfgDir string,
-	localByPath map[string]LocalStat,
+	localPaths map[string]bool,
 	seenDrivePaths map[string]bool,
 	scanned *int,
 	totalEstimate *int,
@@ -257,48 +256,34 @@ func (e *Engine) processScanFiles(
 	for _, relPath := range paths {
 		group := byPath[relPath]
 		seenDrivePaths[relPath] = true
-		localStat, localFound := localByPath[relPath]
-		if !localFound {
+		if !localPaths[relPath] {
 			*totalEstimate++
 		}
 		*scanned++
 
+		if e.isPathBusy(relPath) {
+			continue
+		}
+
+		// Quick filter only: if Sync State DB, live Vault stat, and Drive entry
+		// match LastSynced cleanly, skip; otherwise enqueue for locked resolvePath.
 		rec, hasRec := e.cache.GetFile(relPath)
-		needsEnqueue := false
-
-		if len(group) > 1 {
-			e.log(settings.LogWarning, "Duplicate Drive files at path", relPath)
-			needsEnqueue = true
+		localStat, localFound, statErr := e.vault.Stat(ctx, relPath)
+		if statErr != nil {
+			continue
 		}
 
-		df := group[0]
-		if !hasRec || rec.LastSynced == nil {
-			e.log(settings.LogInfo, "Unknown Drive file discovered", relPath)
-			needsEnqueue = true
-		} else {
-			if rec.Conflict != nil {
-				needsEnqueue = true
-			}
-			if df.ID != rec.LastSynced.DriveFileID ||
-				df.HeadRevisionID != rec.LastSynced.LastSyncedRevisionID ||
-				df.ModifiedTime != rec.LastSynced.DriveModifiedTime {
-				if df.ModifiedTime > rec.LastSynced.DriveModifiedTime {
-					e.log(settings.LogInfo, "Drive file newer than last synced", relPath)
-				}
-				needsEnqueue = true
-			}
-			if !localFound ||
-				localStat.Size != rec.LastSynced.Size ||
-				localStat.MTimeMs != rec.LastSynced.LocalMtimeMs {
-				if localFound && localStat.MTimeMs < rec.LastSynced.LocalMtimeMs {
-					e.log(settings.LogWarning, "Local file older than last synced state", relPath)
-				}
-				needsEnqueue = true
+		if len(group) == 1 && hasRec && rec.LastSynced != nil && rec.Conflict == nil && localFound {
+			df := group[0]
+			if df.ID == rec.LastSynced.DriveFileID &&
+				df.HeadRevisionID == rec.LastSynced.LastSyncedRevisionID &&
+				df.ModifiedTime == rec.LastSynced.DriveModifiedTime &&
+				localStat.Size == rec.LastSynced.Size &&
+				localStat.MTimeMs == rec.LastSynced.LocalMtimeMs {
+				continue
 			}
 		}
 
-		if needsEnqueue {
-			e.queue.Enqueue(relPath, PriorityBulk, "fullscan", e.now(), 0)
-		}
+		e.queue.Enqueue(relPath, PriorityBulk, "fullscan", e.now(), 0)
 	}
 }

@@ -19,7 +19,8 @@ Human-readable design docs live in Go `doc.go`/package godoc under `go/syncstate
 
 `Cache` (`go/syncstate/`) loads all 3 stores once at startup via `Store.LoadAll(ctx)` (`getAll()` per store).
 
-- **Write-through invariant**: Persist to `Store` (IDB) **first**; mutate in-memory maps **only after** IDB succeeds.
+- **Write-through invariant**: All Store+Cache writes serialize through a context-aware channel `writeGate` (never holding `sync.Mutex` across
+  IDB `Await`), persisting to `Store` (IDB) **first** and mutating in-memory maps **only after** IDB succeeds so Store and Cache never invert.
 - **Read performance**: All hot lookups (`changes.list` parent-chain scope checks, conflict count badges, 1 Hz Sync Status snapshots, rename
   correlation) read O(1) from memory with zero IDB transactions.
 - **In-memory indexes** maintained by `Cache`:

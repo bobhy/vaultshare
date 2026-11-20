@@ -210,9 +210,7 @@ func (s *syncService) invoke(method, payload string) (any, error) {
 		return globalStatusFromEngine(eng), nil
 
 	case "startFullScan":
-		go func() {
-			_ = eng.TriggerFullScan(s.ctx)
-		}()
+		eng.RequestFullScan()
 		return struct{}{}, nil
 
 	case "getStatusSnapshot":
